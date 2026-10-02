@@ -1,19 +1,20 @@
 # ══════════════════════════════════════════════════════════════
-# DOCKERFILE - BanChecker Bot
-# Node.js 22 + Chromium (Debian Bookworm) para WhatsApp Web
-# Optimizado para Railway
+# BanChecker Bot - Dockerfile
+# Node 22 + Chromium (Debian Bookworm)
 # ══════════════════════════════════════════════════════════════
 
 FROM node:22-bookworm-slim
 
-# Variables de entorno
+# ARG para invalidar caché cuando sea necesario
+ARG CACHEBUST=2026-10-02
+
 ENV NODE_ENV=production \
     PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
     DEBIAN_FRONTEND=noninteractive \
     TZ=America/Lima
 
-# Instalar Chromium y dependencias mínimas
+# Chromium + dependencias mínimas
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     ca-certificates \
@@ -25,23 +26,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Crear usuario no-root
+# Usuario no-root
 RUN groupadd -r botuser && useradd -r -g botuser -G audio,video botuser \
     && mkdir -p /home/botuser/Downloads \
     && chown -R botuser:botuser /home/botuser
 
 WORKDIR /app
 
-# Copiar package.json e instalar dependencias
+# Dependencias primero (mejor caching de npm)
 COPY package*.json ./
 RUN npm install --omit=dev --no-audit --no-fund \
     && npm cache clean --force
 
-# Copiar código fuente
-COPY --chown=botuser:botuser . .
+# Copia explícita del código (evita problemas con .dockerignore)
+COPY --chown=botuser:botuser src/ ./src/
+COPY --chown=botuser:botuser logs/ ./logs/
 
-# Crear carpetas necesarias
-RUN mkdir -p /app/wa_session /app/logs /app/tokens \
+# ─── DIAGNÓSTICO: ver qué se copió ───
+RUN echo "===== /app =====" && ls -la /app
+RUN echo "===== /app/src =====" && ls -la /app/src
+RUN echo "===== /app/logs =====" && ls -la /app/logs
+RUN test -f /app/src/config.js && echo "✅ config.js EXISTE" || (echo "❌ config.js NO EXISTE" && exit 1)
+
+# Carpetas de sesión
+RUN mkdir -p /app/wa_session /app/tokens \
     && chown -R botuser:botuser /app
 
 USER botuser
