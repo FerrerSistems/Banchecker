@@ -1,6 +1,8 @@
 /**
  * PUNTO DE ENTRADA PRINCIPAL
- * Inicia WhatsApp PRIMERO, Telegram después
+ * - NO envía QR automáticamente (evita spam)
+ * - El QR se envía solo desde /session
+ * - WhatsApp se inicializa en background
  */
 
 // ══════════════════════════════════════════
@@ -42,53 +44,6 @@ const esc = (s) =>
     .replace(/>/g, '&gt;');
 
 // ══════════════════════════════════════════
-// ENVIAR QR AL ADMIN
-// ══════════════════════════════════════════
-async function sendQRToAdmin(qr) {
-  console.log('\n[MAIN] 📲 sendQRToAdmin() invocado');
-  console.log(`[MAIN] QR length: ${qr?.length}`);
-  console.log(`[MAIN] Admin ID: ${config.telegram.adminId}`);
-
-  try {
-    console.log('[MAIN] Generando imagen PNG...');
-    const buffer = await qrModule.generateQRImage(qr);
-    console.log(`[MAIN] Imagen generada: ${(buffer.length / 1024).toFixed(1)} KB`);
-
-    const caption =
-      '📲 <b>NUEVO CÓDIGO QR</b>\n\n' +
-      'Escanea con WhatsApp:\n' +
-      '1. Abre WhatsApp en tu celular\n' +
-      '2. Ajustes → Dispositivos vinculados\n' +
-      '3. Vincular un dispositivo\n\n' +
-      `⏰ ${new Date().toLocaleString('es-ES')}`;
-
-    console.log('[MAIN] Enviando foto a Telegram...');
-    await bot.telegram.sendPhoto(
-      config.telegram.adminId,
-      { source: buffer },
-      { caption, parse_mode: 'HTML' }
-    );
-    console.log('[MAIN] ✅ QR enviado al admin por Telegram\n');
-    return true;
-  } catch (e) {
-    console.error('[MAIN] ❌ Error enviando QR:', e.message);
-    console.error('[MAIN] Stack:', e.stack);
-
-    // Fallback: enviar como texto
-    try {
-      console.log('[MAIN] Intentando enviar QR como texto...');
-      await bot.telegram.sendMessage(
-        config.telegram.adminId,
-        `⚠️ No se pudo enviar el QR como imagen.\n\nError: ${esc(e.message)}\n\nIntenta /session de nuevo.`
-      );
-    } catch (e2) {
-      console.error('[MAIN] ❌ Fallback también falló:', e2.message);
-    }
-    return false;
-  }
-}
-
-// ══════════════════════════════════════════
 // FUNCIÓN PRINCIPAL
 // ══════════════════════════════════════════
 async function main() {
@@ -122,7 +77,7 @@ async function main() {
         const r = await sessionBackup.restoreSession();
         console.log(r.success ? `✅ Restaurada (${r.fileCount} archivos)\n` : `⚠️ ${r.reason}\n`);
       } else {
-        console.log('ℹ️ Sin backup. Se pedirá QR.\n');
+        console.log('ℹ️ Sin backup. Usa /session para generar QR.\n');
       }
     } catch (e) {
       console.log(`⚠️ ${e.message}\n`);
@@ -130,20 +85,18 @@ async function main() {
   }
 
   // ══════════════════════════════════════════
-  // 3. LISTENERS DE WHATSAPP (ANTES DE TODO)
+  // 3. LISTENERS DE WHATSAPP (SIN QR AUTOMÁTICO)
   // ══════════════════════════════════════════
   console.log('[MAIN] Registrando listeners de WhatsApp...');
 
-  whatsapp.emitter.on('qr', async (qr) => {
-    console.log('\n[MAIN] ═══════════════════════════════');
-    console.log('[MAIN] 📲 Evento QR recibido del emitter');
-    console.log('[MAIN] ═══════════════════════════════');
-    await sendQRToAdmin(qr);
-  });
+  // ⚠️ NO hay listener de 'qr' → el QR NO se envía automáticamente
+  // El QR se envía solo cuando el usuario escribe /session o
+  // cuando el usuario hace click en "Generar QR"
 
   whatsapp.emitter.on('authenticated', () => {
     console.log('\n[MAIN] ✅ WhatsApp autenticado\n');
-    qrModule.clearQR();
+    try { qrModule.clearQR(); } catch (e) {}
+    try { whatsapp.clearQR(); } catch (e) {}
   });
 
   whatsapp.emitter.on('ready', async (info) => {
@@ -152,17 +105,23 @@ async function main() {
     try {
       await bot.telegram.sendMessage(
         config.telegram.adminId,
-        `✅ <b>WhatsApp conectado</b>\n\n📞 +${info?.wid?.user}\n👤 ${esc(info?.pushname || 'N/A')}`,
+        `✅ <b>WhatsApp conectado</b>\n\n` +
+        `📞 +${esc(info?.wid?.user)}\n` +
+        `👤 ${esc(info?.pushname || 'N/A')}`,
         { parse_mode: 'HTML' }
       );
     } catch (e) {
       console.error('[MAIN] Error notificando:', e.message);
     }
 
+    // Auto-backup tras 15s
     setTimeout(async () => {
       try {
-        const r = await sessionBackup.backupSession('Auto-backup [bot]', info?.wid?.user);
-        if (r.success) console.log(`[MAIN] ✅ Auto-backup OK (${r.sizeMB.toFixed(2)} MB)\n`);
+        const phone = info?.wid?.user;
+        const r = await sessionBackup.backupSession('Auto-backup [bot]', phone);
+        if (r.success) {
+          console.log(`[MAIN] ✅ Auto-backup OK (${r.sizeMB.toFixed(2)} MB → ${r.filename})\n`);
+        }
       } catch (e) {
         console.error('[MAIN] Error auto-backup:', e.message);
       }
@@ -173,7 +132,8 @@ async function main() {
     console.log(`\n[MAIN] ❌ WhatsApp desconectado: ${reason}\n`);
     bot.telegram.sendMessage(
       config.telegram.adminId,
-      `⚠️ <b>WhatsApp desconectado</b>\n\nMotivo: ${esc(reason)}`,
+      `⚠️ <b>WhatsApp desconectado</b>\n\nMotivo: ${esc(reason)}\n\n` +
+      `💡 Usa /session para reconectar.`,
       { parse_mode: 'HTML' }
     ).catch(() => {});
   });
@@ -182,7 +142,8 @@ async function main() {
     console.log(`\n[MAIN] ❌ Fallo auth: ${msg}\n`);
     bot.telegram.sendMessage(
       config.telegram.adminId,
-      `❌ <b>Fallo de autenticación</b>\n\n${esc(msg)}`,
+      `❌ <b>Fallo de autenticación</b>\n\n${esc(msg)}\n\n` +
+      `💡 Usa /session logout y luego /session para generar un QR nuevo.`,
       { parse_mode: 'HTML' }
     ).catch(() => {});
   });
@@ -190,7 +151,7 @@ async function main() {
   console.log('[MAIN] ✅ Listeners registrados\n');
 
   // ══════════════════════════════════════════
-  // 4. INICIAR WHATSAPP
+  // 4. INICIAR WHATSAPP (BACKGROUND, SIN BLOQUEAR)
   // ══════════════════════════════════════════
   console.log('📱 Iniciando WhatsApp (Chrome)...');
   console.log('   ⏳ Puede tardar 1-3 minutos\n');
@@ -199,40 +160,11 @@ async function main() {
     .then(() => console.log('[MAIN] ✅ WhatsApp inicializado\n'))
     .catch((e) => {
       console.error('[MAIN] ❌ Error inicializando WhatsApp:', e.message);
-      console.error(e.stack);
+      // NO crashear el bot si WhatsApp falla — el usuario puede usar /session
     });
 
   // ══════════════════════════════════════════
-  // 5. TIMEOUT: Si en 3 min no hay QR ni conexión → forzar restart
-  // ══════════════════════════════════════════
-  setTimeout(async () => {
-    try {
-      const diag = whatsapp.getDiagnostics();
-
-      if (!diag.ready && !diag.hasQR) {
-        console.log('\n[MAIN] ⚠️ 3 min sin QR ni conexión. Forzando restart...');
-        console.log('[MAIN] Diag:', JSON.stringify(diag, null, 2));
-
-        try {
-          await bot.telegram.sendMessage(
-            config.telegram.adminId,
-            `⚠️ <b>WhatsApp no responde</b>\n\n` +
-            `Evento: <code>${esc(diag.lastEvent)}</code>\n` +
-            `Error: ${esc(diag.initError || 'ninguno')}\n\n` +
-            `🔄 Forzando reinicio...`,
-            { parse_mode: 'HTML' }
-          );
-        } catch {}
-
-        await whatsapp.restartForQR();
-      }
-    } catch (e) {
-      console.error('[MAIN] Error en timeout restart:', e.message);
-    }
-  }, 3 * 60 * 1000);
-
-  // ══════════════════════════════════════════
-  // 6. TELEGRAM
+  // 5. TELEGRAM (BLOQUEANTE)
   // ══════════════════════════════════════════
   console.log('🤖 Iniciando bot de Telegram...');
 
@@ -241,10 +173,11 @@ async function main() {
     console.log('✅ Bot de Telegram iniciado\n');
   } catch (e) {
     console.error('❌ Error Telegram:', e.message);
+    process.exit(1);
   }
 
   // ══════════════════════════════════════════
-  // 7. MONITOR
+  // 6. MONITOR
   // ══════════════════════════════════════════
   console.log('⏰ Iniciando monitor...');
   try {
@@ -255,7 +188,7 @@ async function main() {
   }
 
   // ══════════════════════════════════════════
-  // 8. BACKUP PERIÓDICO (cada 6h)
+  // 7. BACKUP PERIÓDICO (cada 6h)
   // ══════════════════════════════════════════
   setInterval(async () => {
     try {
@@ -267,10 +200,15 @@ async function main() {
   }, 6 * 60 * 60 * 1000);
 
   // ══════════════════════════════════════════
-  // 9. FIN
+  // 8. FIN
   // ══════════════════════════════════════════
   console.log('══════════════════════════════════════════════');
   console.log('  ✅ BOT OPERATIVO');
+  console.log('  📱 WhatsApp: Inicializando en background');
+  console.log('  🤖 Telegram: Activo');
+  console.log('  ⏰ Monitor: Cada 60s');
+  console.log('  💾 Backup: Cada 6h + al cerrar');
+  console.log('  📲 QR: Solo con /session (sin spam)');
   console.log('══════════════════════════════════════════════\n');
 }
 
