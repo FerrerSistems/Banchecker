@@ -1,10 +1,9 @@
 /**
- * MÓDULO DE WHATSAPP — v4 FINAL
- * - isRegisteredUser() como método PRINCIPAL (oficial)
- * - protocolTimeout alto (10 min) para evitar CDP hangs
- * - Health check antes de cada operación
- * - Auto-restart si el page está colgado
- * - Full debug con stack traces
+ * MÓDULO DE WHATSAPP — v5 CORREGIDO
+ * - NO borra la sesión cuando la página se rompe
+ * - reconnect() preserva la sesión
+ * - restartForQR() solo se llama desde /session (borra sesión)
+ * - checkNumberStatus sin health check destructivo
  */
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
@@ -16,7 +15,7 @@ const { dbg } = config;
 const emitter = new EventEmitter();
 
 // ══════════════════════════════════════════
-// ESTADO GLOBAL
+// ESTADO
 // ══════════════════════════════════════════
 
 let client = null;
@@ -28,8 +27,8 @@ let isInitializing = false;
 let initStartTime = null;
 let initError = null;
 let initAttempts = 0;
+let reconnecting = false;
 
-// Mutex para serializar checks
 let checkLock = Promise.resolve();
 
 // ══════════════════════════════════════════
@@ -40,13 +39,10 @@ const stats = {
   totalChecks: 0,
   successChecks: 0,
   failedChecks: 0,
-  timeoutChecks: 0,
-  restarts: 0,
-  pageHealthchecksOK: 0,
-  pageHealthchecksFail: 0,
+  reconnects: 0,
+  qrRegens: 0,
   avgCheckMs: 0,
   lastCheckMs: 0,
-  peakHeapMB: 0,
   startTime: Date.now(),
 };
 
@@ -66,35 +62,31 @@ function uptime() {
   const s = Math.floor(process.uptime());
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  return `${h}h${m}m${sec}s`;
+  return `${h}h${m}m${s % 60}s`;
 }
 
 function log(tag, msg, data) {
   const m = memInfo();
   const extra = data !== undefined ? ' | ' + JSON.stringify(data) : '';
-  console.log(`[${new Date().toISOString()}] [${tag}] [heap:${m.heap}MB rss:${m.rss}MB up:${uptime()}] ${msg}${extra}`);
-  const heapNum = parseFloat(m.heap);
-  if (heapNum > stats.peakHeapMB) stats.peakHeapMB = heapNum;
+  console.log(`[${new Date().toISOString()}] [${tag}] [heap:${m.heap}MB up:${uptime()}] ${msg}${extra}`);
 }
 
 function logError(tag, msg, err) {
   const m = memInfo();
-  console.error(`[${new Date().toISOString()}] [${tag}] [heap:${m.heap}MB rss:${m.rss}MB] ❌ ${msg}`);
+  console.error(`[${new Date().toISOString()}] [${tag}] [heap:${m.heap}MB] ❌ ${msg}`);
   if (err) {
     if (err.name) console.error(`[${tag}]   name: ${err.name}`);
     if (err.message) console.error(`[${tag}]   message: ${err.message}`);
     if (err.label) console.error(`[${tag}]   label: ${err.label}`);
-    if (err.elapsedMs) console.error(`[${tag}]   elapsedMs: ${err.elapsedMs}`);
     if (err.stack) {
-      const lines = err.stack.split('\n').slice(0, 6);
+      const lines = err.stack.split('\n').slice(0, 5);
       lines.forEach(l => console.error(`[${tag}]   ${l.trim()}`));
     }
   }
 }
 
 // ══════════════════════════════════════════
-// TIMEOUT CANCELABLE
+// TIMEOUT
 // ══════════════════════════════════════════
 
 function withTimeout(promise, ms, label) {
@@ -108,7 +100,7 @@ function withTimeout(promise, ms, label) {
       err.isTimeout = true;
       err.label = label;
       err.elapsedMs = Date.now() - start;
-      logError('TIMEOUT', `"${label}" TIMEOUT en ${err.elapsedMs}ms`, err);
+      logError('TIMEOUT', `"${label}" TIMEOUT en ${err.elapsedMs}ms`);
       reject(err);
     }, ms);
 
@@ -126,53 +118,36 @@ function withTimeout(promise, ms, label) {
         reject(e);
       }
     ).catch((e) => {
-      // Silenciar errores tardíos
-      log('TIMEOUT', `Error tardío en "${label}" ignorado: ${e.message}`);
+      log('TIMEOUT', `Error tardío en "${label}": ${e.message}`);
     });
   });
 }
 
 // ══════════════════════════════════════════
-// HEALTH CHECK DE LA PÁGINA
+// DETECCIÓN DE ERRORES DE PÁGINA
 // ══════════════════════════════════════════
 
-async function healthCheckPage() {
-  if (!client || !client.pupPage) {
-    log('HEALTH', 'No hay pupPage');
-    return false;
-  }
-
-  try {
-    const start = Date.now();
-    const result = await withTimeout(
-      client.pupPage.evaluate(() => 2 + 2),
-      5000,
-      'healthcheck'
-    );
-    const elapsed = Date.now() - start;
-
-    if (result === 4) {
-      stats.pageHealthchecksOK++;
-      log('HEALTH', `✅ Página responde en ${elapsed}ms`);
-      return true;
-    }
-
-    stats.pageHealthchecksFail++;
-    logError('HEALTH', `Página devolvió ${result} (esperado 4)`);
-    return false;
-  } catch (e) {
-    stats.pageHealthchecksFail++;
-    logError('HEALTH', `❌ Página NO responde: ${e.message}`);
-    return false;
-  }
+function isPageBroken(err) {
+  if (!err) return false;
+  const msg = (err.message || '').toLowerCase();
+  return (
+    msg.includes('detached frame') ||
+    msg.includes('target closed') ||
+    msg.includes('session closed') ||
+    msg.includes('execution context was destroyed') ||
+    msg.includes('page crashed') ||
+    msg.includes('protocol error') ||
+    msg.includes('navigation failed') ||
+    msg.includes('runtime.callfunctionon timed out')
+  );
 }
 
 // ══════════════════════════════════════════
-// CREAR CLIENTE
+// CREAR CLIENTE (con o sin sesión)
 // ══════════════════════════════════════════
 
-function createClient() {
-  log('WHATSAPP', '═══════ CREANDO CLIENTE ═══════');
+function createClient(clearSession = false) {
+  log('WHATSAPP', `═══════ CREANDO CLIENTE (clearSession=${clearSession}) ═══════`);
 
   let chromePath = config.whatsapp.chromePath;
 
@@ -189,7 +164,22 @@ function createClient() {
   }
 
   if (!chromePath) throw new Error('Chrome no encontrado');
-  log('WHATSAPP', `Chrome: ${chromePath}`);
+
+  // Si clearSession, borrar antes de crear
+  if (clearSession) {
+    const sessionDir = config.whatsapp.sessionPath;
+    if (fs.existsSync(sessionDir)) {
+      log('WHATSAPP', '🗑️ Limpiando sesión local (clearSession=true)');
+      try {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+        fs.mkdirSync(sessionDir, { recursive: true });
+      } catch (e) {
+        logError('WHATSAPP', 'Error limpiando sesión', e);
+      }
+    }
+  } else {
+    log('WHATSAPP', '📁 Preservando sesión local');
+  }
 
   const newClient = new Client({
     authStrategy: new LocalAuth({
@@ -199,8 +189,7 @@ function createClient() {
     puppeteer: {
       executablePath: chromePath,
       headless: true,
-      // ⭐ CRÍTICO: Aumentar protocolTimeout para evitar "Runtime.callFunctionOn timed out"
-      protocolTimeout: 600000, // 10 minutos
+      protocolTimeout: 600000,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -218,14 +207,11 @@ function createClient() {
         '--no-default-browser-check',
         '--password-store=basic',
         '--use-mock-keychain',
-        // Reducir memoria de Chrome
-        '--single-process',
-        '--disable-features=site-per-process,IsolateOrigins',
       ],
     },
   });
 
-  log('WHATSAPP', '✅ Cliente creado, registrando eventos...');
+  log('WHATSAPP', '✅ Cliente creado');
 
   // ══════════════════════════════════════════
   // EVENTOS
@@ -237,8 +223,7 @@ function createClient() {
     try {
       const QRCode = require('qrcode');
       currentQRBuffer = await QRCode.toBuffer(qr, {
-        type: 'png', width: 600, margin: 2,
-        errorCorrectionLevel: 'M',
+        type: 'png', width: 600, margin: 2, errorCorrectionLevel: 'M',
       });
       log('WHATSAPP', `💾 QR buffer: ${(currentQRBuffer.length / 1024).toFixed(1)}KB`);
     } catch (e) {
@@ -271,11 +256,11 @@ function createClient() {
     log('WHATSAPP', '═══════ ✅ CLIENTE LISTO ═══════');
     isReady = true;
     isInitializing = false;
+    reconnecting = false;
 
     const info = newClient.info;
     log('WHATSAPP', `Número: +${info?.wid?.user}`);
     log('WHATSAPP', `Nombre: ${info?.pushname}`);
-    log('WHATSAPP', `Init total: ${((Date.now() - initStartTime) / 1000).toFixed(1)}s`);
 
     emitter.emit('ready', info);
     readyResolvers.forEach(r => r(newClient));
@@ -286,6 +271,7 @@ function createClient() {
     logError('WHATSAPP', `DESCONECTADO: ${reason}`);
     isReady = false;
     isInitializing = false;
+    reconnecting = false;
     client = null;
     emitter.emit('disconnected', reason);
   });
@@ -299,14 +285,16 @@ function createClient() {
 }
 
 // ══════════════════════════════════════════
-// INICIALIZAR
+// INICIALIZAR (con o sin limpiar sesión)
 // ══════════════════════════════════════════
 
-async function initializeWhatsApp() {
-  log('WHATSAPP', '═══════ INICIALIZANDO ═══════');
+async function initializeWhatsApp(clearSession = false) {
+  log('WHATSAPP', `═══════ INICIALIZANDO (clearSession=${clearSession}) ═══════`);
 
-  if (client && isReady) return client;
+  if (client && isReady && !clearSession) return client;
+
   if (isInitializing) {
+    log('WHATSAPP', 'Ya inicializando, esperando...');
     return new Promise((resolve) => {
       readyResolvers.push(() => resolve(client));
     });
@@ -318,8 +306,16 @@ async function initializeWhatsApp() {
   initStartTime = Date.now();
   initError = null;
 
+  // Destruir cliente previo si existe
+  if (client) {
+    log('WHATSAPP', 'Destruyendo cliente previo...');
+    try { await client.destroy(); } catch (e) {}
+    client = null;
+    isReady = false;
+  }
+
   try {
-    client = createClient();
+    client = createClient(clearSession);
   } catch (e) {
     isInitializing = false;
     initError = e.message;
@@ -328,7 +324,7 @@ async function initializeWhatsApp() {
 
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      logError('WHATSAPP', `TIMEOUT init 5min. Último evento: N/A`);
+      logError('WHATSAPP', `TIMEOUT init 5min`);
       isInitializing = false;
       reject(new Error('Timeout init'));
     }, 5 * 60 * 1000);
@@ -352,57 +348,75 @@ async function initializeWhatsApp() {
 }
 
 // ══════════════════════════════════════════
-// RESTART
+// RECONNECT — preserva la sesión
+// ══════════════════════════════════════════
+
+async function reconnect() {
+  if (reconnecting) {
+    log('WHATSAPP', 'Reconnect ya en progreso, esperando...');
+    return new Promise((resolve) => {
+      readyResolvers.push(() => resolve(client));
+    });
+  }
+
+  log('WHATSAPP', '═══════ RECONNECT (preservando sesión) ═══════');
+  reconnecting = true;
+  stats.reconnects++;
+
+  try {
+    return await initializeWhatsApp(false); // ← NO borra sesión
+  } catch (e) {
+    logError('WHATSAPP', 'Error en reconnect', e);
+    reconnecting = false;
+    throw e;
+  }
+}
+
+// ══════════════════════════════════════════
+// RESTART FOR QR — solo desde /session
 // ══════════════════════════════════════════
 
 async function restartForQR() {
-  log('WHATSAPP', '═══════ RESTART PARA QR ═══════');
-  stats.restarts++;
+  log('WHATSAPP', '═══════ RESTART PARA QR (borrando sesión) ═══════');
+  stats.qrRegens++;
 
   try {
     if (client) {
       try { await client.destroy(); } catch (e) {}
     }
-
     client = null;
     isReady = false;
     isInitializing = false;
+    reconnecting = false;
     currentQR = null;
     currentQRBuffer = null;
     initError = null;
 
-    const sessionDir = config.whatsapp.sessionPath;
-    if (fs.existsSync(sessionDir)) {
-      try {
-        fs.rmSync(sessionDir, { recursive: true, force: true });
-        fs.mkdirSync(sessionDir, { recursive: true });
-      } catch (e) {}
-    }
-
-    return await initializeWhatsApp();
+    return await initializeWhatsApp(true); // ← SÍ borra sesión
   } catch (e) {
-    logError('WHATSAPP', 'Error restartForQR', e);
+    logError('WHATSAPP', 'Error en restartForQR', e);
     throw e;
   }
 }
 
+// ══════════════════════════════════════════
+// GET READY CLIENT
+// ══════════════════════════════════════════
+
 async function getReadyClient() {
   if (client && isReady) return client;
-  if (!client || !isInitializing) return initializeWhatsApp();
+  if (!client || (!isInitializing && !reconnecting)) return initializeWhatsApp(false);
   return new Promise((resolve) => {
     readyResolvers.push(() => resolve(client));
   });
 }
 
 // ══════════════════════════════════════════
-// VERIFICAR ESTADO DE UN NÚMERO
-// Solo usa isRegisteredUser() — método oficial
+// CHECK NUMBER STATUS — CORREGIDO
 // ══════════════════════════════════════════
 
 async function checkNumberStatus(phone) {
-  // Serializar checks: solo uno a la vez
   const release = await acquireLock();
-
   const start = Date.now();
   stats.totalChecks++;
 
@@ -413,7 +427,7 @@ async function checkNumberStatus(phone) {
 
   try {
     // ══════════════════════════════════════════
-    // PASO 0: ¿Está conectado?
+    // PASO 0: ¿Conectado?
     // ══════════════════════════════════════════
     if (!isReady || !client) {
       const msg = currentQRBuffer
@@ -429,40 +443,11 @@ async function checkNumberStatus(phone) {
 
     const c = client;
     const chatId = `${phone}@c.us`;
-    const numberOnly = phone;
 
     // ══════════════════════════════════════════
-    // PASO 1: Health check de la página
+    // PASO 1: isRegisteredUser (método oficial)
     // ══════════════════════════════════════════
-    log('CHECK', '[PASO 1/3] Health check de la página...');
-    const healthy = await healthCheckPage();
-
-    if (!healthy) {
-      logError('CHECK', 'Página no responde. Necesita restart.');
-
-      // Programar restart (sin bloquear la respuesta al usuario)
-      setImmediate(async () => {
-        log('CHECK', 'Programando restart por página no responde...');
-        try {
-          await restartForQR();
-        } catch (e) {
-          logError('CHECK', 'Error en restart automático', e);
-        }
-      });
-
-      return {
-        status: 'ERROR',
-        message: '⚠️ WhatsApp no responde. Reiniciando...\n\nIntenta de nuevo en 1-2 minutos.',
-        raw: { reason: 'page_unresponsive' },
-      };
-    }
-
-    log('CHECK', '[PASO 1/3] ✅ Página OK');
-
-    // ══════════════════════════════════════════
-    // PASO 2: isRegisteredUser (método OFICIAL)
-    // ══════════════════════════════════════════
-    log('CHECK', `[PASO 2/3] isRegisteredUser(${numberOnly})...`);
+    log('CHECK', `[PASO 1/2] isRegisteredUser(${phone})...`);
 
     let isRegistered = null;
     let checkMethod = 'isRegisteredUser';
@@ -471,7 +456,7 @@ async function checkNumberStatus(phone) {
       const t0 = Date.now();
       isRegistered = await withTimeout(
         c.isRegisteredUser(chatId),
-        30000,
+        25000,
         'isRegisteredUser'
       );
       const elapsed = Date.now() - t0;
@@ -479,15 +464,29 @@ async function checkNumberStatus(phone) {
     } catch (e) {
       logError('CHECK', `isRegisteredUser falló`, e);
 
+      // ⭐ Si la página está rota, reconnect en background (SIN borrar sesión)
+      if (isPageBroken(e)) {
+        log('CHECK', '⚠️ Página rota. Programando reconnect (preservando sesión)...');
+        setImmediate(() => {
+          reconnect().catch(err => logError('CHECK', 'Error reconnect', err));
+        });
+
+        return {
+          status: 'ERROR',
+          message: '⚠️ WhatsApp se desconectó. Reconectando...\n\nIntenta en 30 segundos.',
+          raw: { reason: 'page_broken', error: e.message },
+        };
+      }
+
       // Fallback: getNumberId
-      log('CHECK', `Fallback: getNumberId(${numberOnly})...`);
+      log('CHECK', `Fallback: getNumberId(${phone})...`);
       checkMethod = 'getNumberId';
 
       try {
         const t0 = Date.now();
         const numberId = await withTimeout(
-          c.getNumberId(numberOnly),
-          30000,
+          c.getNumberId(phone),
+          25000,
           'getNumberId'
         );
         const elapsed = Date.now() - t0;
@@ -497,55 +496,64 @@ async function checkNumberStatus(phone) {
       } catch (e2) {
         logError('CHECK', `getNumberId también falló`, e2);
 
+        if (isPageBroken(e2)) {
+          log('CHECK', '⚠️ Página rota. Programando reconnect...');
+          setImmediate(() => {
+            reconnect().catch(err => logError('CHECK', 'Error reconnect', err));
+          });
+
+          return {
+            status: 'ERROR',
+            message: '⚠️ WhatsApp se desconectó. Reconectando...\n\nIntenta en 30 segundos.',
+            raw: { reason: 'page_broken', error: e2.message },
+          };
+        }
+
         const totalElapsed = Date.now() - start;
-
-        // Programar restart si ambos fallan
-        setImmediate(async () => {
-          log('CHECK', 'Ambos métodos fallaron. Programando restart...');
-          try { await restartForQR(); } catch (e) {}
-        });
-
         return {
           status: 'ERROR',
-          message: `⏱️ WhatsApp no responde (${(totalElapsed / 1000).toFixed(1)}s). Reiniciando...\n\nIntenta en 1-2 minutos.`,
+          message: `⏱️ WhatsApp no responde (${(totalElapsed / 1000).toFixed(1)}s). Intenta de nuevo.`,
           raw: { error1: e.message, error2: e2.message, elapsedMs: totalElapsed },
         };
       }
     }
 
     // ══════════════════════════════════════════
-    // PASO 3: Interpretar
+    // PASO 2: Interpretar
     // ══════════════════════════════════════════
-    const totalElapsed = Date.now() - start;
-    stats.lastCheckMs = totalElapsed;
-    stats.avgCheckMs = stats.avgCheckMs === 0
-      ? totalElapsed
-      : (stats.avgCheckMs + totalElapsed) / 2;
+    const elapsed = Date.now() - start;
+    stats.lastCheckMs = elapsed;
+    stats.avgCheckMs = stats.avgCheckMs === 0 ? elapsed : (stats.avgCheckMs + elapsed) / 2;
 
     if (isRegistered === false) {
-      log('CHECK', `❌ NO registrado → PERMANENT_BAN (${totalElapsed}ms)`);
+      log('CHECK', `❌ NO registrado → PERMANENT_BAN (${elapsed}ms)`);
       stats.failedChecks++;
-
       return {
         status: 'PERMANENT_BAN',
         message: '❌ No está registrado en WhatsApp',
-        raw: { isRegistered: false, method: checkMethod, elapsedMs: totalElapsed },
+        raw: { isRegistered: false, method: checkMethod, elapsedMs: elapsed },
       };
     }
 
-    log('CHECK', `✅ ACTIVO (${totalElapsed}ms) — método: ${checkMethod}`);
+    log('CHECK', `✅ ACTIVO (${elapsed}ms) — método: ${checkMethod}`);
     stats.successChecks++;
 
     return {
       status: 'ACTIVE',
       message: '✅ Número activo',
-      raw: { isRegistered: true, method: checkMethod, elapsedMs: totalElapsed },
+      raw: { isRegistered: true, method: checkMethod, elapsedMs: elapsed },
     };
   } catch (e) {
     logError('CHECK', 'Error general', e);
     stats.failedChecks++;
-
     const elapsed = Date.now() - start;
+
+    if (isPageBroken(e)) {
+      setImmediate(() => {
+        reconnect().catch(err => logError('CHECK', 'Error reconnect', err));
+      });
+    }
+
     return {
       status: 'ERROR',
       message: `❌ Error: ${e.message}`,
@@ -557,7 +565,7 @@ async function checkNumberStatus(phone) {
 }
 
 // ══════════════════════════════════════════
-// MUTEX SIMPLE
+// MUTEX
 // ══════════════════════════════════════════
 
 function acquireLock() {
@@ -583,6 +591,7 @@ async function destroyClient() {
     client = null;
     isReady = false;
     isInitializing = false;
+    reconnecting = false;
   }
 }
 
@@ -590,6 +599,7 @@ function getDiagnostics() {
   return {
     ready: isReady,
     initializing: isInitializing,
+    reconnecting,
     hasQR: !!currentQRBuffer,
     initError,
     initAttempts,
@@ -612,6 +622,7 @@ function getStats() { return { ...stats }; }
 module.exports = {
   createClient,
   initializeWhatsApp,
+  reconnect,
   restartForQR,
   getReadyClient,
   checkNumberStatus,
