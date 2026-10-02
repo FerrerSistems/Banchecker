@@ -1,8 +1,14 @@
-/**
- * PUNTO DE ENTRADA PRINCIPAL
- * Inicializa WhatsApp, Telegram y el monitor
- * Con backup/restore de sesión en GitHub
- */
+// ══════════════════════════════════════════
+// DIAGNÓSTICO TEMPORAL DE VARIABLES
+// ══════════════════════════════════════════
+console.log('--- DIAGNÓSTICO DE VARIABLES ---');
+console.log('TELEGRAM_BOT_TOKEN:', process.env.TELEGRAM_BOT_TOKEN ? `DEFINIDA (${process.env.TELEGRAM_BOT_TOKEN.length} chars)` : 'NO DEFINIDA');
+console.log('GITHUB_TOKEN:', process.env.GITHUB_TOKEN ? `DEFINIDA (${process.env.GITHUB_TOKEN.length} chars)` : 'NO DEFINIDA');
+console.log('GITHUB_OWNER:', process.env.GITHUB_OWNER || 'NO DEFINIDA');
+console.log('GITHUB_REPO:', process.env.GITHUB_REPO || 'NO DEFINIDA');
+console.log('ADMIN_TELEGRAM_ID:', process.env.ADMIN_TELEGRAM_ID || 'NO DEFINIDA');
+console.log('TOTAL ENV VARS:', Object.keys(process.env).length);
+console.log('--- FIN DIAGNÓSTICO ---');
 
 const config = require('./config');
 const { dbg } = config;
