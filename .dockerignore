@@ -1,43 +1,20 @@
-# Dependencias
 node_modules
 npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Entorno
 .env
 .env.*
 !.env.example
-
-# Sesión de WhatsApp (NO subir)
 wa_session
 tokens
-
-# Logs
 logs/*.log
-*.log
-
-# Git
 .git
 .gitignore
-.gitattributes
-
-# Docker
-Dockerfile
-.dockerignore
-docker-compose.yml
-
-# IDE
 .vscode
 .idea
 *.swp
-*.swo
-*~
-
-# OS
 .DS_Store
 Thumbs.db
-
-# Docs
+Dockerfile
+.dockerignore
+docker-compose.yml
 README.md
 LICENSE
