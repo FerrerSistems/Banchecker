@@ -1,6 +1,9 @@
 /**
- * BOT DE TELEGRAM — VERSIÓN COMPLETA
- * HTML en lugar de Markdown, try/catch en todo, multi-sesión, errores inteligentes
+ * BOT DE TELEGRAM — VERSIÓN FINAL
+ * - NO envía QR automáticamente
+ * - /session muestra estado y envía QR solo si el usuario lo pide
+ * - HTML en lugar de Markdown
+ * - Full try/catch
  */
 
 const { Telegraf, Markup } = require('telegraf');
@@ -72,11 +75,7 @@ dbg('BOT', 'Bot inicializado');
 
 bot.use(async (ctx, next) => {
   const userId = ctx.from?.id?.toString();
-
-  if (!userId) {
-    dbg('BOT', 'Usuario sin ID, ignorando');
-    return;
-  }
+  if (!userId) return;
 
   if (ctx.from.id === config.telegram.adminId) {
     return next();
@@ -98,7 +97,7 @@ bot.use(async (ctx, next) => {
     return next();
   } catch (e) {
     dbg('BOT', `Error verificando auth: ${e.message}`);
-    return ctx.reply('❌ Error verificando autorización. Intenta más tarde.');
+    return ctx.reply('❌ Error verificando autorización.').catch(() => {});
   }
 });
 
@@ -127,8 +126,6 @@ bot.start(async (ctx) => {
       buttons.push([Markup.button.callback('🔐 Sesión', 'help_session')]);
     }
 
-    const keyboard = Markup.inlineKeyboard(buttons);
-
     const msg =
       '👋 <b>¡Bienvenido a BanChecker Bot!</b>\n\n' +
       '🔍 Verifico si números de WhatsApp están activos o baneados.\n\n' +
@@ -143,10 +140,9 @@ bot.start(async (ctx) => {
       '💡 <b>Ejemplo:</b> <code>/status 51 999999999</code>\n\n' +
       `🆔 Tu ID: <code>${esc(userId)}</code>`;
 
-    await ctx.replyWithHTML(msg, keyboard);
+    await ctx.replyWithHTML(msg, Markup.inlineKeyboard(buttons));
   } catch (e) {
     dbg('BOT', `Error en /start: ${e.message}`);
-    console.error(e);
   }
 });
 
@@ -165,15 +161,14 @@ bot.help(async (ctx) => {
       'O todo junto: <code>&lt;DDI&gt;&lt;NÚMERO&gt;</code>\n\n' +
       '✅ <code>/status 51 999999999</code>\n' +
       '✅ <code>/status 51999999999</code>\n' +
-      '❌ <code>/status +51 999-999-999</code>\n' +
-      '❌ <code>/status 999999999</code> (sin DDI)\n\n' +
+      '❌ <code>/status +51 999-999-999</code>\n\n' +
       '🌎 <b>DDI comunes:</b>\n' +
       '🇵🇪 Perú: 51 | 🇲🇽 México: 52 | 🇦🇷 Argentina: 54\n' +
       '🇨🇴 Colombia: 57 | 🇨🇱 Chile: 56 | 🇪🇸 España: 34\n\n' +
       '🔹 <b>VERIFICACIÓN</b>\n' +
       '<code>/status 51 999999999</code>\n' +
       '• ✅ Activo\n' +
-      '• ⚠️ Baneo temporal (solicitar revisión)\n' +
+      '• ⚠️ Baneo temporal\n' +
       '• 🚫 Baneo por spam\n' +
       '• ❌ Baneo permanente\n\n' +
       '🔹 <b>MONITOREO</b>\n' +
@@ -189,7 +184,6 @@ bot.help(async (ctx) => {
     await ctx.replyWithHTML(msg);
   } catch (e) {
     dbg('BOT', `Error en /help: ${e.message}`);
-    console.error(e);
     await ctx.reply('❌ Error mostrando ayuda.').catch(() => {});
   }
 });
@@ -218,11 +212,10 @@ bot.command('status', async (ctx) => {
     }
 
     const parsed = parsePhone(args);
-
     if (!parsed) {
       return ctx.replyWithHTML(
         '❌ <b>Número inválido</b>\n\n' +
-        'Incluye el DDI (código de país).\n\n' +
+        'Incluye el DDI.\n\n' +
         'Ejemplo: <code>/status 51 999999999</code>'
       );
     }
@@ -230,10 +223,9 @@ bot.command('status', async (ctx) => {
     const { phone, pretty } = parsed;
 
     processingMsg = await ctx.reply(
-      `🔄 Verificando ${pretty}... Esto puede tomar unos segundos.`
+      `🔄 Verificando ${pretty}... Esto puede tomar hasta 30 segundos.`
     );
 
-    dbg('BOT', `Verificando ${phone}...`);
     const result = await whatsapp.checkNumberStatus(phone);
     dbg('BOT', `Resultado: ${result.status}`);
 
@@ -253,30 +245,19 @@ bot.command('status', async (ctx) => {
       `${emoji} <b>RESULTADO</b>\n\n` +
       `📱 Número: <code>${esc(pretty)}</code>\n` +
       `📊 Estado: <b>${esc(statusText)}</b>\n` +
-      `💬 Mensaje: ${esc(result.message)}\n` +
+      `💬 ${esc(result.message)}\n` +
       `⏰ ${esc(new Date().toLocaleString('es-ES'))}`;
 
     await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      processingMsg.message_id,
-      undefined,
-      msg,
+      ctx.chat.id, processingMsg.message_id, undefined, msg,
       { parse_mode: 'HTML' }
-    ).catch(async () => {
-      await ctx.replyWithHTML(msg);
-    });
+    ).catch(() => ctx.replyWithHTML(msg).catch(() => {}));
   } catch (e) {
     dbg('BOT', `Error en /status: ${e.message}`);
-    console.error(e);
-
     const errMsg = `❌ <b>Error:</b> ${esc(e.message)}`;
-
     if (processingMsg) {
       await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        processingMsg.message_id,
-        undefined,
-        errMsg,
+        ctx.chat.id, processingMsg.message_id, undefined, errMsg,
         { parse_mode: 'HTML' }
       ).catch(() => ctx.replyWithHTML(errMsg).catch(() => {}));
     } else {
@@ -310,11 +291,9 @@ bot.command('monitoradd', async (ctx) => {
     }
 
     const parsed = parsePhone(args);
-
     if (!parsed) {
       return ctx.replyWithHTML(
         '❌ <b>Número inválido</b>\n\n' +
-        'Incluye el DDI.\n\n' +
         'Ejemplo: <code>/monitoradd 51 999999999</code>'
       );
     }
@@ -327,9 +306,7 @@ bot.command('monitoradd', async (ctx) => {
 
     if (check.status !== 'ACTIVE' && check.status !== 'VERIFY') {
       return ctx.telegram.editMessageText(
-        ctx.chat.id,
-        processingMsg.message_id,
-        undefined,
+        ctx.chat.id, processingMsg.message_id, undefined,
         `⚠️ <b>El número no está activo</b>\n\n` +
         `📊 Estado: ${esc(check.message)}\n\n` +
         `💡 No se puede monitorear un número baneado.`,
@@ -342,27 +319,19 @@ bot.command('monitoradd', async (ctx) => {
     if (!result.success) {
       let reason = 'Error desconocido';
       switch (result.reason) {
-        case 'already_exists':
-          reason = 'El número ya está en tu lista de monitoreo.';
-          break;
-        case 'already_suspended':
-          reason = 'El número ya está marcado como suspendido (baneado).';
-          break;
+        case 'already_exists': reason = 'El número ya está en tu lista.'; break;
+        case 'already_suspended': reason = 'El número ya está marcado como suspendido.'; break;
       }
 
       return ctx.telegram.editMessageText(
-        ctx.chat.id,
-        processingMsg.message_id,
-        undefined,
+        ctx.chat.id, processingMsg.message_id, undefined,
         `⚠️ <b>No se pudo agregar</b>\n\n${esc(reason)}`,
         { parse_mode: 'HTML' }
       );
     }
 
     await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      processingMsg.message_id,
-      undefined,
+      ctx.chat.id, processingMsg.message_id, undefined,
       `✅ <b>Agregado a monitoreo</b>\n\n` +
       `📱 <code>${esc(pretty)}</code>\n` +
       `⏰ Verificación cada 60s\n\n` +
@@ -371,16 +340,10 @@ bot.command('monitoradd', async (ctx) => {
     );
   } catch (e) {
     dbg('BOT', `Error en /monitoradd: ${e.message}`);
-    console.error(e);
-
     const errMsg = `❌ <b>Error:</b> ${esc(e.message)}`;
-
     if (processingMsg) {
       await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        processingMsg.message_id,
-        undefined,
-        errMsg,
+        ctx.chat.id, processingMsg.message_id, undefined, errMsg,
         { parse_mode: 'HTML' }
       ).catch(() => ctx.replyWithHTML(errMsg).catch(() => {}));
     } else {
@@ -417,7 +380,6 @@ bot.command('list', async (ctx) => {
     );
   } catch (e) {
     dbg('BOT', `Error en /list: ${e.message}`);
-    console.error(e);
     await ctx.reply(`❌ Error: ${e.message}`).catch(() => {});
   }
 });
@@ -450,7 +412,6 @@ bot.command('listban', async (ctx) => {
     );
   } catch (e) {
     dbg('BOT', `Error en /listban: ${e.message}`);
-    console.error(e);
     await ctx.reply(`❌ Error: ${e.message}`).catch(() => {});
   }
 });
@@ -511,7 +472,6 @@ bot.command('add', async (ctx) => {
     dbg('BOT', `Usuario ${targetId} autorizado por ${durationStr}`);
   } catch (e) {
     dbg('BOT', `Error en /add: ${e.message}`);
-    console.error(e);
     await ctx.reply(`❌ Error: ${e.message}`).catch(() => {});
   }
 });
@@ -541,13 +501,12 @@ bot.command('remove', async (ctx) => {
     await ctx.replyWithHTML(`✅ Usuario <code>${esc(targetId)}</code> eliminado.`);
   } catch (e) {
     dbg('BOT', `Error en /remove: ${e.message}`);
-    console.error(e);
     await ctx.reply(`❌ Error: ${e.message}`).catch(() => {});
   }
 });
 
 // ══════════════════════════════════════════
-// /session (SOLO ADMIN) — Multi-sesión
+// /session (SOLO ADMIN)
 // ══════════════════════════════════════════
 
 bot.command('session', async (ctx) => {
@@ -558,12 +517,10 @@ bot.command('session', async (ctx) => {
     return ctx.reply('⛔ Solo admin.');
   }
 
-  let sessionBackup, qrModule;
+  let sessionBackup;
   try {
     sessionBackup = require('./session-backup');
-    qrModule = require('./qr');
   } catch (e) {
-    dbg('BOT', `Error importando módulos: ${e.message}`);
     return ctx.reply(`❌ Error interno: ${e.message}`);
   }
 
@@ -572,16 +529,18 @@ bot.command('session', async (ctx) => {
     const subcommand = args[0]?.toLowerCase();
 
     // ══════════════════════════════════════════
-    // /session (estado + QR automático)
+    // /session (estado + QR si hace falta)
     // ══════════════════════════════════════════
     if (!subcommand) {
       const hasLocal = sessionBackup.hasLocalSession();
       const waReady = whatsapp.isReady();
       const info = whatsapp.getClient()?.info;
-      const hasQR = qrModule.hasQR();
+      const hasQR = whatsapp.hasQR();
       const diag = whatsapp.getDiagnostics();
 
-      // SI NO ESTÁ CONECTADO NI HAY QR → FORZAR QR
+      // ────────────────────────────────────────
+      // CASO 1: NO conectado, NO QR → generar QR
+      // ─────────────────────────────────────────
       if (!waReady && !hasQR) {
         const msg = await ctx.reply(
           '🔄 Generando QR... Esto puede tardar 1-2 minutos.\n\n' +
@@ -590,19 +549,16 @@ bot.command('session', async (ctx) => {
         );
 
         try {
-          dbg('BOT', 'Forzando restart para generar QR...');
           await whatsapp.restartForQR();
 
           await ctx.telegram.editMessageText(
             ctx.chat.id, msg.message_id, undefined,
             '✅ Cliente reiniciado.\n\n' +
-            '⏳ Esperando que WhatsApp genere el QR...\n' +
-            'Cuando aparezca, te lo enviaré automáticamente.\n\n' +
-            'Si pasan 2 minutos sin respuesta, vuelve a usar /session.',
+            '⏳ Esperando que WhatsApp genere el QR...\n\n' +
+            '💡 Envía /session de nuevo en 30 segundos para recibir el QR.',
             { parse_mode: 'HTML' }
           );
         } catch (e) {
-          dbg('BOT', `Error forzando QR: ${e.message}`);
           await ctx.telegram.editMessageText(
             ctx.chat.id, msg.message_id, undefined,
             `❌ Error al generar QR: ${esc(e.message)}`,
@@ -612,22 +568,44 @@ bot.command('session', async (ctx) => {
         return;
       }
 
-      // ESTADO NORMAL
+      // ────────────────────────────────────────
+      // CASO 2: NO conectado, SÍ hay QR → enviarlo
+      // ─────────────────────────────────────────
+      if (!waReady && hasQR) {
+        const buffer = whatsapp.getQRBuffer();
+
+        if (buffer) {
+          try {
+            await ctx.replyWithPhoto(
+              { source: buffer },
+              {
+                caption:
+                  `📲 <b>QR PENDIENTE</b>\n\n` +
+                  `Escanea con WhatsApp:\n` +
+                  `1️⃣ Abre WhatsApp\n` +
+                  `2️⃣ Ajustes → Dispositivos vinculados\n` +
+                  `3️⃣ Vincular un dispositivo\n\n` +
+                  `⚠️ Expira en ~20 segundos. Si expira, usa /session de nuevo.`,
+                parse_mode: 'HTML',
+              }
+            );
+          } catch (e) {
+            await ctx.reply(`⚠️ No se pudo enviar el QR: ${e.message}`);
+          }
+        } else {
+          await ctx.reply('⚠️ QR no disponible. Usa /session logout y /session de nuevo.');
+        }
+        return;
+      }
+
+      // ────────────────────────────────────────
+      // CASO 3: Conectado → mostrar estado completo
+      // ─────────────────────────────────────────
       const lines = [
         '🔐 <b>ESTADO DE SESIÓN</b>',
         '',
         `📱 WhatsApp: ${waReady ? '✅ Conectado' : '❌ Desconectado'}`,
-        `🔧 Inicializando: ${diag.initializing ? '⏳ Sí' : 'No'}`,
-        `📡 Último evento: <code>${esc(diag.lastEvent)}</code>`,
       ];
-
-      if (diag.initElapsedSec) {
-        lines.push(`⏱️ Tiempo init: ${diag.initElapsedSec}s`);
-      }
-
-      if (diag.initError) {
-        lines.push(`❌ Error: ${esc(diag.initError)}`);
-      }
 
       if (info?.wid?.user) {
         lines.push(`📞 Número: <code>${esc(prettyPhone(info.wid.user))}</code>`);
@@ -635,46 +613,29 @@ bot.command('session', async (ctx) => {
       }
 
       lines.push(`💾 Sesión local: ${hasLocal ? '✅' : '❌'}`);
-      lines.push(`📲 QR pendiente: ${hasQR ? '✅' : '❌'}`);
 
       try {
         const remoteInfo = await sessionBackup.getRemoteBackupInfo();
         if (remoteInfo) {
           const phoneLabel = remoteInfo.phone ? prettyPhone(remoteInfo.phone) : 'Legacy';
-          lines.push(`☁️ Backup GitHub: ✅ ${phoneLabel} (${remoteInfo.sizeMB.toFixed(2)} MB)`);
+          lines.push(`☁️ Backup GitHub: ✅ ${esc(phoneLabel)}`);
         } else {
-          lines.push(`☁️ Backup GitHub: ❌ No hay`);
+          lines.push(`☁️ Backup GitHub: ❌`);
         }
       } catch (e) {
-        lines.push(`☁️ Backup GitHub: ⚠️ Error`);
+        lines.push(`☁️ Backup GitHub: ⚠️`);
       }
 
-      // Listar todas las sesiones guardadas
       try {
         const sessions = await sessionBackup.listSessions();
-        if (sessions.length > 0) {
-          lines.push('');
-          lines.push(`📦 <b>Sesiones guardadas:</b> ${sessions.length}`);
-          sessions.slice(0, 5).forEach((s, i) => {
-            lines.push(`${i + 1}. <code>${esc(s.pretty)}</code>`);
-          });
-          if (sessions.length > 5) {
-            lines.push(`... y ${sessions.length - 5} más`);
-          }
-        } else {
-          lines.push('');
-          lines.push('📦 <b>Sesiones guardadas:</b> Ninguna');
-        }
-      } catch (e) {
-        lines.push(`📦 Sesiones: ⚠️ Error`);
-      }
+        lines.push(`📦 Sesiones guardadas: ${sessions.length}`);
+      } catch (e) {}
 
       lines.push('');
       lines.push('📋 <b>Subcomandos:</b>');
-      lines.push('<code>/session</code> — Ver estado (o generar QR)');
-      lines.push('<code>/session list</code> — Ver todas las sesiones');
+      lines.push('<code>/session list</code> — Ver sesiones');
       lines.push('<code>/session backup</code> — Subir a GitHub');
-      lines.push('<code>/session restore</code> — Restaurar desde GitHub');
+      lines.push('<code>/session restore</code> — Restaurar');
       lines.push('<code>/session logout</code> — Borrar sesión');
 
       const keyboard = Markup.inlineKeyboard([
@@ -686,32 +647,10 @@ bot.command('session', async (ctx) => {
           Markup.button.callback('☁️ Backup', 'session_backup'),
           Markup.button.callback('🔽 Restore', 'session_restore'),
         ],
-        [
-          Markup.button.callback('🚪 Logout', 'session_logout'),
-        ],
+        [Markup.button.callback('🚪 Logout', 'session_logout')],
       ]);
 
       await ctx.replyWithHTML(lines.join('\n'), keyboard);
-
-      if (hasQR) {
-        try {
-          const qrBuffer = qrModule.getCurrentQRBuffer();
-          if (qrBuffer) {
-            await ctx.replyWithPhoto(
-              { source: qrBuffer },
-              {
-                caption:
-                  `📲 <b>QR PENDIENTE</b>\n\n` +
-                  `⏰ ${esc(qrModule.getCurrentQRTime()?.toLocaleString('es-ES') || 'N/A')}\n\n` +
-                  `Escanea con WhatsApp → Dispositivos vinculados`,
-                parse_mode: 'HTML',
-              }
-            );
-          }
-        } catch (e) {
-          dbg('BOT', `Error enviando QR: ${e.message}`);
-        }
-      }
       return;
     }
 
@@ -725,8 +664,7 @@ bot.command('session', async (ctx) => {
         if (sessions.length === 0) {
           return ctx.replyWithHTML(
             '📦 <b>No hay sesiones guardadas</b>\n\n' +
-            '💡 Cuando conectes un WhatsApp, se guardará automáticamente\n' +
-            'con el formato <code>session_&lt;número&gt;.zip</code>'
+            '💡 Cuando conectes un WhatsApp, se guardará automáticamente.'
           );
         }
 
@@ -743,15 +681,13 @@ bot.command('session', async (ctx) => {
 
         const buttons = sessions.slice(0, 10).map(s => {
           const label = s.phone ? prettyPhone(s.phone) : 'Legacy';
-          return [Markup.button.callback(`▶️ Restaurar ${label}`, `sess_restore_${s.phone || 'legacy'}`)];
+          return [Markup.button.callback(`▶️ ${label}`, `sess_restore_${s.phone || 'legacy'}`)];
         });
-
         buttons.push([Markup.button.callback('❌ Cerrar', 'session_close')]);
 
         await ctx.replyWithHTML(
           `📦 <b>SESIONES GUARDADAS</b> (${sessions.length})\n\n${list}\n\n` +
-          `🟢 = Sesión activa actualmente\n\n` +
-          `💡 Toca una para restaurarla:`,
+          `🟢 = Activa\n\n💡 Toca una para restaurar:`,
           Markup.inlineKeyboard(buttons)
         );
       } catch (e) {
@@ -770,14 +706,14 @@ bot.command('session', async (ctx) => {
       try {
         const info = whatsapp.getClient()?.info;
         const phone = info?.wid?.user;
-        const result = await sessionBackup.backupSession('Manual backup [bot]', phone);
+        const result = await sessionBackup.backupSession('Manual [bot]', phone);
 
         if (result.success) {
           const phoneLabel = result.phone ? prettyPhone(result.phone) : 'Legacy';
           await ctx.telegram.editMessageText(
             ctx.chat.id, msg.message_id, undefined,
             `✅ <b>Backup completado</b>\n\n` +
-            `📞 Número: <code>${esc(phoneLabel)}</code>\n` +
+            `📞 <code>${esc(phoneLabel)}</code>\n` +
             `📦 ${result.sizeMB.toFixed(2)} MB\n` +
             `📁 ${result.fileCount} archivos\n` +
             `☁️ <code>logs/${esc(result.filename)}</code>`,
@@ -786,9 +722,7 @@ bot.command('session', async (ctx) => {
         } else {
           await ctx.telegram.editMessageText(
             ctx.chat.id, msg.message_id, undefined,
-            `⚠️ <b>No se pudo hacer backup</b>\n\n` +
-            `💡 ${esc(result.message || result.reason)}\n\n` +
-            `🔧 Verifica que WhatsApp esté conectado.`,
+            `⚠️ <b>No se pudo hacer backup</b>\n\n💡 ${esc(result.message || result.reason)}`,
             { parse_mode: 'HTML' }
           );
         }
@@ -812,7 +746,7 @@ bot.command('session', async (ctx) => {
 
         if (result.success) {
           const phoneLabel = result.filename
-            ? (sessionBackup.phoneFromFilename(result.filename) 
+            ? (sessionBackup.phoneFromFilename(result.filename)
                 ? prettyPhone(sessionBackup.phoneFromFilename(result.filename))
                 : 'Legacy')
             : 'N/A';
@@ -822,14 +756,13 @@ bot.command('session', async (ctx) => {
             `✅ <b>Sesión restaurada</b>\n\n` +
             `📞 ${esc(phoneLabel)}\n` +
             `📁 ${result.fileCount} archivos\n\n` +
-            `💡 Reinicia el bot desde Railway para aplicarla.`,
+            `💡 Reinicia el bot en Railway para aplicarla.`,
             { parse_mode: 'HTML' }
           );
         } else {
           await ctx.telegram.editMessageText(
             ctx.chat.id, msg.message_id, undefined,
-            `⚠️ <b>No se pudo restaurar</b>\n\n` +
-            `💡 ${esc(result.message || result.reason)}`,
+            `⚠️ <b>No se pudo restaurar</b>\n\n💡 ${esc(result.message || result.reason)}`,
             { parse_mode: 'HTML' }
           );
         }
@@ -855,9 +788,7 @@ bot.command('session', async (ctx) => {
 
       return ctx.replyWithHTML(
         '⚠️ <b>¿Seguro?</b>\n\n' +
-        'Borrará TODAS las sesiones:\n' +
-        '• Sesión local en Railway\n' +
-        '• Todos los backups en GitHub\n\n' +
+        'Borrará TODAS las sesiones (local + GitHub).\n' +
         'Necesitarás escanear un QR nuevo.\n\n' +
         '¿Continuar?',
         keyboard
@@ -885,48 +816,34 @@ bot.action('help_status', async (ctx) => {
   try {
     await ctx.answerCbQuery();
     await ctx.replyWithHTML(
-      '🔍 <b>Verificar número</b>\n\n' +
-      '<code>/status 51 999999999</code>\n\n' +
-      '💡 DDI + número, con espacio o junto.'
+      '🔍 <b>Verificar número</b>\n\n<code>/status 51 999999999</code>'
     );
-  } catch (e) {
-    dbg('BOT', `Error help_status: ${e.message}`);
-  }
+  } catch (e) {}
 });
 
 bot.action('help_monitor', async (ctx) => {
   try {
     await ctx.answerCbQuery();
     await ctx.replyWithHTML(
-      '➕ <b>Monitorear</b>\n\n' +
-      '<code>/monitoradd 51 999999999</code>\n\n' +
-      '💡 Verificación cada 60s.'
+      '➕ <b>Monitorear</b>\n\n<code>/monitoradd 51 999999999</code>\n\n💡 Cada 60s.'
     );
-  } catch (e) {
-    dbg('BOT', `Error help_monitor: ${e.message}`);
-  }
+  } catch (e) {}
 });
 
 bot.action('help_list', async (ctx) => {
   try {
     await ctx.answerCbQuery();
     await ctx.replyWithHTML(
-      '📋 <b>Listas</b>\n\n' +
-      '<code>/list</code> — Monitoreados\n' +
-      '<code>/listban</code> — Baneados'
+      '📋 <b>Listas</b>\n\n<code>/list</code> — Monitoreados\n<code>/listban</code> — Baneados'
     );
-  } catch (e) {
-    dbg('BOT', `Error help_list: ${e.message}`);
-  }
+  } catch (e) {}
 });
 
 bot.action('help_general', async (ctx) => {
   try {
     await ctx.answerCbQuery();
-    await ctx.replyWithHTML('ℹ️ Usa <code>/help</code> para la ayuda completa.');
-  } catch (e) {
-    dbg('BOT', `Error help_general: ${e.message}`);
-  }
+    await ctx.replyWithHTML('ℹ️ Usa <code>/help</code>.');
+  } catch (e) {}
 });
 
 bot.action('help_session', async (ctx) => {
@@ -935,18 +852,16 @@ bot.action('help_session', async (ctx) => {
     await ctx.replyWithHTML(
       '🔐 <b>Sesión WhatsApp</b>\n\n' +
       '<code>/session</code> — Estado y QR\n' +
-      '<code>/session list</code> — Ver todas las sesiones\n' +
-      '<code>/session backup</code> — Subir a GitHub\n' +
+      '<code>/session list</code> — Ver sesiones\n' +
+      '<code>/session backup</code> — Subir\n' +
       '<code>/session restore</code> — Restaurar\n' +
-      '<code>/session logout</code> — Borrar todas'
+      '<code>/session logout</code> — Borrar'
     );
-  } catch (e) {
-    dbg('BOT', `Error help_session: ${e.message}`);
-  }
+  } catch (e) {}
 });
 
 // ══════════════════════════════════════════
-// ACCIÓN: Forzar QR
+// ACCIÓN: Generar QR
 // ══════════════════════════════════════════
 
 bot.action('session_forceqr', async (ctx) => {
@@ -955,22 +870,19 @@ bot.action('session_forceqr', async (ctx) => {
       return ctx.answerCbQuery('Solo admin');
     }
 
-    await ctx.answerCbQuery('Reiniciando cliente...');
+    await ctx.answerCbQuery('Reiniciando...');
 
     const msg = await ctx.reply(
-      '🔄 Reiniciando cliente de WhatsApp...\n\n' +
-      '⏳ Esto puede tardar 1-2 minutos.\n' +
-      'Cuando el QR esté listo, te lo enviaré automáticamente.'
+      '🔄 Reiniciando cliente...\n\n' +
+      '⏳ Espera 30 segundos y luego envía /session para recibir el QR.'
     );
 
     try {
       await whatsapp.restartForQR();
-
       await ctx.telegram.editMessageText(
         ctx.chat.id, msg.message_id, undefined,
         '✅ Cliente reiniciado.\n\n' +
-        '⏳ Esperando QR de WhatsApp...\n\n' +
-        'Debería llegarte en 1-2 minutos.',
+        '💡 Envía /session en 30 segundos para recibir el QR.',
         { parse_mode: 'HTML' }
       );
     } catch (e) {
@@ -982,7 +894,6 @@ bot.action('session_forceqr', async (ctx) => {
     }
   } catch (e) {
     dbg('BOT', `Error session_forceqr: ${e.message}`);
-    await ctx.reply(`❌ ${e.message}`).catch(() => {});
   }
 });
 
@@ -1023,13 +934,11 @@ bot.action('session_list', async (ctx) => {
       const label = s.phone ? prettyPhone(s.phone) : 'Legacy';
       return [Markup.button.callback(`▶️ ${label}`, `sess_restore_${s.phone || 'legacy'}`)];
     });
-
     buttons.push([Markup.button.callback('❌ Cerrar', 'session_close')]);
 
     await ctx.replyWithHTML(
       `📦 <b>SESIONES GUARDADAS</b> (${sessions.length})\n\n${list}\n\n` +
-      `🟢 = Activa actualmente\n\n` +
-      `💡 Toca una para restaurar:`,
+      `🟢 = Activa\n\n💡 Toca una para restaurar:`,
       Markup.inlineKeyboard(buttons)
     );
   } catch (e) {
@@ -1052,49 +961,44 @@ bot.action(/^sess_restore_(.+)$/, async (ctx) => {
     const phone = phoneRaw === 'legacy' ? null : phoneRaw;
 
     await ctx.answerCbQuery('Restaurando...');
-
     const sessionBackup = require('./session-backup');
     const label = phone ? prettyPhone(phone) : 'Legacy';
 
-    const msg = await ctx.reply(`🔄 Restaurando sesión ${label}...`);
-
+    const msg = await ctx.reply(`🔄 Restaurando ${label}...`);
     const result = await sessionBackup.restoreSession(phone);
 
     if (result.success) {
       await ctx.telegram.editMessageText(
         ctx.chat.id, msg.message_id, undefined,
-        `✅ <b>Sesión restaurada</b>\n\n` +
+        `✅ <b>Restaurada</b>\n\n` +
         `📞 ${esc(label)}\n` +
         `📁 ${result.fileCount} archivos\n` +
-        `📦 ${esc(result.filename)}\n\n` +
-        `⚠️ <b>Reinicia el bot</b> en Railway para usarla.`,
+        `📦 <code>${esc(result.filename)}</code>\n\n` +
+        `⚠️ Reinicia el bot en Railway para usarla.`,
         { parse_mode: 'HTML' }
       );
     } else {
       await ctx.telegram.editMessageText(
         ctx.chat.id, msg.message_id, undefined,
-        `⚠️ <b>No se pudo restaurar</b>\n\n` +
-        `💡 ${esc(result.message || result.reason)}`,
+        `⚠️ <b>No se pudo restaurar</b>\n\n💡 ${esc(result.message || result.reason)}`,
         { parse_mode: 'HTML' }
       );
     }
   } catch (e) {
-    dbg('BOT', `Error restaurando sesión: ${e.message}`);
+    dbg('BOT', `Error restaurando: ${e.message}`);
     await ctx.reply(`❌ ${e.message}`).catch(() => {});
   }
 });
 
 // ══════════════════════════════════════════
-// ACCIÓN: Cerrar menú
+// ACCIÓN: Cerrar
 // ══════════════════════════════════════════
 
 bot.action('session_close', async (ctx) => {
   try {
     await ctx.answerCbQuery('Cerrado');
     await ctx.deleteMessage().catch(() => {});
-  } catch (e) {
-    dbg('BOT', `Error session_close: ${e.message}`);
-  }
+  } catch (e) {}
 });
 
 // ══════════════════════════════════════════
@@ -1107,36 +1011,30 @@ bot.action('session_backup', async (ctx) => {
       return ctx.answerCbQuery('Solo admin');
     }
 
-    await ctx.answerCbQuery('Iniciando backup...');
+    await ctx.answerCbQuery('Backup...');
     const sessionBackup = require('./session-backup');
-
     const info = whatsapp.getClient()?.info;
     const phone = info?.wid?.user;
 
-    const result = await sessionBackup.backupSession('Backup via botón [bot]', phone);
+    const result = await sessionBackup.backupSession('Backup botón [bot]', phone);
 
     if (result.success) {
       const phoneLabel = result.phone ? prettyPhone(result.phone) : 'Legacy';
       await ctx.replyWithHTML(
-        `✅ <b>Backup completado</b>\n\n` +
-        `📞 ${esc(phoneLabel)}\n` +
-        `📦 ${result.sizeMB.toFixed(2)} MB\n` +
-        `📁 ${result.fileCount} archivos`
+        `✅ <b>Backup OK</b>\n\n📞 ${esc(phoneLabel)}\n📦 ${result.sizeMB.toFixed(2)} MB`
       );
     } else {
       await ctx.replyWithHTML(
-        `⚠️ <b>No se pudo hacer backup</b>\n\n` +
-        `💡 ${esc(result.message || result.reason)}`
+        `⚠️ <b>No se pudo</b>\n\n💡 ${esc(result.message || result.reason)}`
       );
     }
   } catch (e) {
     dbg('BOT', `Error session_backup: ${e.message}`);
-    await ctx.reply(`❌ ${e.message}`).catch(() => {});
   }
 });
 
 // ══════════════════════════════════════════
-// ACCIÓN: Restore (genérico)
+// ACCIÓN: Restore genérico
 // ══════════════════════════════════════════
 
 bot.action('session_restore', async (ctx) => {
@@ -1147,30 +1045,19 @@ bot.action('session_restore', async (ctx) => {
 
     await ctx.answerCbQuery('Restaurando...');
     const sessionBackup = require('./session-backup');
-
     const result = await sessionBackup.restoreSession();
 
     if (result.success) {
-      const phoneLabel = result.filename
-        ? (sessionBackup.phoneFromFilename(result.filename)
-            ? prettyPhone(sessionBackup.phoneFromFilename(result.filename))
-            : 'Legacy')
-        : 'N/A';
-
       await ctx.replyWithHTML(
-        `✅ <b>Restaurada</b> (${result.fileCount} archivos)\n` +
-        `📞 ${esc(phoneLabel)}\n\n` +
-        `⚠️ Reinicia el bot para aplicarla.`
+        `✅ Restaurada (${result.fileCount} archivos)\n⚠️ Reinicia el bot.`
       );
     } else {
       await ctx.replyWithHTML(
-        `⚠️ <b>No se pudo restaurar</b>\n\n` +
-        `💡 ${esc(result.message || result.reason)}`
+        `⚠️ <b>No se pudo</b>\n\n💡 ${esc(result.message || result.reason)}`
       );
     }
   } catch (e) {
     dbg('BOT', `Error session_restore: ${e.message}`);
-    await ctx.reply(`❌ ${e.message}`).catch(() => {});
   }
 });
 
@@ -1195,15 +1082,11 @@ bot.action('session_logout', async (ctx) => {
 
     await ctx.replyWithHTML(
       '⚠️ <b>¿Seguro?</b>\n\n' +
-      'Borrará TODAS las sesiones:\n' +
-      '• Local en Railway\n' +
-      '• Backups en GitHub\n\n' +
-      'Necesitarás escanear un QR nuevo.',
+      'Borrará TODAS las sesiones.\n\n' +
+      '¿Continuar?',
       keyboard
     );
-  } catch (e) {
-    dbg('BOT', `Error session_logout: ${e.message}`);
-  }
+  } catch (e) {}
 });
 
 bot.action('session_logout_confirm', async (ctx) => {
@@ -1215,9 +1098,9 @@ bot.action('session_logout_confirm', async (ctx) => {
     await ctx.answerCbQuery('Borrando...');
     const sessionBackup = require('./session-backup');
     await sessionBackup.deleteSession();
-    await ctx.editMessageText('✅ Todas las sesiones eliminadas. Reinicia el bot en Railway.').catch(() => {});
+    await ctx.editMessageText('✅ Todo eliminado. Reinicia el bot.').catch(() => {});
   } catch (e) {
-    dbg('BOT', `Error session_logout_confirm: ${e.message}`);
+    dbg('BOT', `Error logout_confirm: ${e.message}`);
     await ctx.reply(`❌ ${e.message}`).catch(() => {});
   }
 });
@@ -1226,9 +1109,7 @@ bot.action('session_logout_cancel', async (ctx) => {
   try {
     await ctx.answerCbQuery('Cancelado');
     await ctx.editMessageText('❌ Cancelado.').catch(() => {});
-  } catch (e) {
-    dbg('BOT', `Error session_logout_cancel: ${e.message}`);
-  }
+  } catch (e) {}
 });
 
 // ══════════════════════════════════════════
