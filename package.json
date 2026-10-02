@@ -1,0 +1,25 @@
+{
+  "name": "banchecker-bot",
+  "version": "1.0.0",
+  "description": "Bot de Telegram para verificar y monitorear bans de WhatsApp",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "docker:build": "docker build -t banchecker-bot .",
+    "docker:run": "docker run --rm -it --env-file .env -v $(pwd)/wa_session:/app/wa_session banchecker-bot"
+  },
+  "dependencies": {
+    "@octokit/rest": "^20.1.1",
+    "adm-zip": "^0.5.16",
+    "dotenv": "^16.4.5",
+    "puppeteer": "^23.0.0",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "telegraf": "^4.16.3",
+    "whatsapp-web.js": "^1.26.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
