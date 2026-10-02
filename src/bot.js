@@ -1,6 +1,6 @@
 /**
  * BOT DE TELEGRAM — VERSIÓN COMPLETA
- * HTML en lugar de Markdown, try/catch en todo, /session fuerza QR
+ * HTML en lugar de Markdown, try/catch en todo, multi-sesión, errores inteligentes
  */
 
 const { Telegraf, Markup } = require('telegraf');
@@ -184,7 +184,7 @@ bot.help(async (ctx) => {
       '🔹 <b>ADMIN</b>\n' +
       '<code>/add &lt;id&gt; &lt;duración&gt;</code> — Autorizar (ej: 7d, 2h, 30m)\n' +
       '<code>/remove &lt;id&gt;</code> — Eliminar usuario\n' +
-      '<code>/session</code> — Gestión de sesión WhatsApp';
+      '<code>/session</code> — Gestión de sesiones WhatsApp';
 
     await ctx.replyWithHTML(msg);
   } catch (e) {
@@ -343,10 +343,10 @@ bot.command('monitoradd', async (ctx) => {
       let reason = 'Error desconocido';
       switch (result.reason) {
         case 'already_exists':
-          reason = 'El número ya está en tu lista.';
+          reason = 'El número ya está en tu lista de monitoreo.';
           break;
         case 'already_suspended':
-          reason = 'El número ya está marcado como suspendido.';
+          reason = 'El número ya está marcado como suspendido (baneado).';
           break;
       }
 
@@ -547,7 +547,7 @@ bot.command('remove', async (ctx) => {
 });
 
 // ══════════════════════════════════════════
-// /session (SOLO ADMIN)
+// /session (SOLO ADMIN) — Multi-sesión
 // ══════════════════════════════════════════
 
 bot.command('session', async (ctx) => {
@@ -640,17 +640,39 @@ bot.command('session', async (ctx) => {
       try {
         const remoteInfo = await sessionBackup.getRemoteBackupInfo();
         if (remoteInfo) {
-          lines.push(`☁️ Backup GitHub: ✅ ${remoteInfo.sizeMB.toFixed(2)} MB`);
+          const phoneLabel = remoteInfo.phone ? prettyPhone(remoteInfo.phone) : 'Legacy';
+          lines.push(`☁️ Backup GitHub: ✅ ${phoneLabel} (${remoteInfo.sizeMB.toFixed(2)} MB)`);
         } else {
-          lines.push(`☁️ Backup GitHub: ❌`);
+          lines.push(`☁️ Backup GitHub: ❌ No hay`);
         }
       } catch (e) {
         lines.push(`☁️ Backup GitHub: ⚠️ Error`);
       }
 
+      // Listar todas las sesiones guardadas
+      try {
+        const sessions = await sessionBackup.listSessions();
+        if (sessions.length > 0) {
+          lines.push('');
+          lines.push(`📦 <b>Sesiones guardadas:</b> ${sessions.length}`);
+          sessions.slice(0, 5).forEach((s, i) => {
+            lines.push(`${i + 1}. <code>${esc(s.pretty)}</code>`);
+          });
+          if (sessions.length > 5) {
+            lines.push(`... y ${sessions.length - 5} más`);
+          }
+        } else {
+          lines.push('');
+          lines.push('📦 <b>Sesiones guardadas:</b> Ninguna');
+        }
+      } catch (e) {
+        lines.push(`📦 Sesiones: ⚠️ Error`);
+      }
+
       lines.push('');
       lines.push('📋 <b>Subcomandos:</b>');
       lines.push('<code>/session</code> — Ver estado (o generar QR)');
+      lines.push('<code>/session list</code> — Ver todas las sesiones');
       lines.push('<code>/session backup</code> — Subir a GitHub');
       lines.push('<code>/session restore</code> — Restaurar desde GitHub');
       lines.push('<code>/session logout</code> — Borrar sesión');
@@ -658,10 +680,13 @@ bot.command('session', async (ctx) => {
       const keyboard = Markup.inlineKeyboard([
         [
           Markup.button.callback('🔐 Generar QR', 'session_forceqr'),
-          Markup.button.callback('☁️ Backup', 'session_backup'),
+          Markup.button.callback('📦 Ver sesiones', 'session_list'),
         ],
         [
+          Markup.button.callback('☁️ Backup', 'session_backup'),
           Markup.button.callback('🔽 Restore', 'session_restore'),
+        ],
+        [
           Markup.button.callback('🚪 Logout', 'session_logout'),
         ],
       ]);
@@ -690,26 +715,80 @@ bot.command('session', async (ctx) => {
       return;
     }
 
-    // ── /session backup
+    // ══════════════════════════════════════════
+    // /session list
+    // ══════════════════════════════════════════
+    if (subcommand === 'list') {
+      try {
+        const sessions = await sessionBackup.listSessions();
+
+        if (sessions.length === 0) {
+          return ctx.replyWithHTML(
+            '📦 <b>No hay sesiones guardadas</b>\n\n' +
+            '💡 Cuando conectes un WhatsApp, se guardará automáticamente\n' +
+            'con el formato <code>session_&lt;número&gt;.zip</code>'
+          );
+        }
+
+        const currentInfo = whatsapp.getClient()?.info;
+        const currentPhone = currentInfo?.wid?.user;
+
+        const list = sessions
+          .map((s, i) => {
+            const isCurrent = currentPhone && s.phone === currentPhone;
+            const badge = isCurrent ? ' 🟢' : '';
+            return `${i + 1}. <code>${esc(s.pretty)}</code>${badge}`;
+          })
+          .join('\n');
+
+        const buttons = sessions.slice(0, 10).map(s => {
+          const label = s.phone ? prettyPhone(s.phone) : 'Legacy';
+          return [Markup.button.callback(`▶️ Restaurar ${label}`, `sess_restore_${s.phone || 'legacy'}`)];
+        });
+
+        buttons.push([Markup.button.callback('❌ Cerrar', 'session_close')]);
+
+        await ctx.replyWithHTML(
+          `📦 <b>SESIONES GUARDADAS</b> (${sessions.length})\n\n${list}\n\n` +
+          `🟢 = Sesión activa actualmente\n\n` +
+          `💡 Toca una para restaurarla:`,
+          Markup.inlineKeyboard(buttons)
+        );
+      } catch (e) {
+        dbg('BOT', `Error en /session list: ${e.message}`);
+        await ctx.reply(`❌ Error: ${e.message}`).catch(() => {});
+      }
+      return;
+    }
+
+    // ══════════════════════════════════════════
+    // /session backup
+    // ══════════════════════════════════════════
     if (subcommand === 'backup') {
       const msg = await ctx.reply('🔼 Subiendo sesión a GitHub...');
 
       try {
-        const result = await sessionBackup.backupSession('Manual backup [bot]');
+        const info = whatsapp.getClient()?.info;
+        const phone = info?.wid?.user;
+        const result = await sessionBackup.backupSession('Manual backup [bot]', phone);
 
         if (result.success) {
+          const phoneLabel = result.phone ? prettyPhone(result.phone) : 'Legacy';
           await ctx.telegram.editMessageText(
             ctx.chat.id, msg.message_id, undefined,
             `✅ <b>Backup completado</b>\n\n` +
+            `📞 Número: <code>${esc(phoneLabel)}</code>\n` +
             `📦 ${result.sizeMB.toFixed(2)} MB\n` +
             `📁 ${result.fileCount} archivos\n` +
-            `☁️ <code>logs/session.zip</code>`,
+            `☁️ <code>logs/${esc(result.filename)}</code>`,
             { parse_mode: 'HTML' }
           );
         } else {
           await ctx.telegram.editMessageText(
             ctx.chat.id, msg.message_id, undefined,
-            `⚠️ <b>Falló:</b> ${esc(result.reason)}${result.error ? '\n' + esc(result.error) : ''}`,
+            `⚠️ <b>No se pudo hacer backup</b>\n\n` +
+            `💡 ${esc(result.message || result.reason)}\n\n` +
+            `🔧 Verifica que WhatsApp esté conectado.`,
             { parse_mode: 'HTML' }
           );
         }
@@ -722,7 +801,9 @@ bot.command('session', async (ctx) => {
       return;
     }
 
-    // ── /session restore
+    // ══════════════════════════════════════════
+    // /session restore
+    // ══════════════════════════════════════════
     if (subcommand === 'restore') {
       const msg = await ctx.reply('🔽 Restaurando desde GitHub...');
 
@@ -730,17 +811,25 @@ bot.command('session', async (ctx) => {
         const result = await sessionBackup.restoreSession();
 
         if (result.success) {
+          const phoneLabel = result.filename
+            ? (sessionBackup.phoneFromFilename(result.filename) 
+                ? prettyPhone(sessionBackup.phoneFromFilename(result.filename))
+                : 'Legacy')
+            : 'N/A';
+
           await ctx.telegram.editMessageText(
             ctx.chat.id, msg.message_id, undefined,
             `✅ <b>Sesión restaurada</b>\n\n` +
+            `📞 ${esc(phoneLabel)}\n` +
             `📁 ${result.fileCount} archivos\n\n` +
-            `💡 Reinicia el bot para aplicarla.`,
+            `💡 Reinicia el bot desde Railway para aplicarla.`,
             { parse_mode: 'HTML' }
           );
         } else {
           await ctx.telegram.editMessageText(
             ctx.chat.id, msg.message_id, undefined,
-            `⚠️ <b>Falló:</b> ${esc(result.reason)}`,
+            `⚠️ <b>No se pudo restaurar</b>\n\n` +
+            `💡 ${esc(result.message || result.reason)}`,
             { parse_mode: 'HTML' }
           );
         }
@@ -753,19 +842,23 @@ bot.command('session', async (ctx) => {
       return;
     }
 
-    // ── /session logout
+    // ══════════════════════════════════════════
+    // /session logout
+    // ══════════════════════════════════════════
     if (subcommand === 'logout') {
       const keyboard = Markup.inlineKeyboard([
         [
-          Markup.button.callback('⚠️ SÍ, borrar', 'session_logout_confirm'),
+          Markup.button.callback('⚠️ SÍ, borrar todo', 'session_logout_confirm'),
           Markup.button.callback('❌ Cancelar', 'session_logout_cancel'),
         ],
       ]);
 
       return ctx.replyWithHTML(
         '⚠️ <b>¿Seguro?</b>\n\n' +
-        'Borrará sesión local + GitHub.\n' +
-        'Necesitarás nuevo QR.\n\n' +
+        'Borrará TODAS las sesiones:\n' +
+        '• Sesión local en Railway\n' +
+        '• Todos los backups en GitHub\n\n' +
+        'Necesitarás escanear un QR nuevo.\n\n' +
         '¿Continuar?',
         keyboard
       );
@@ -773,8 +866,9 @@ bot.command('session', async (ctx) => {
 
     return ctx.replyWithHTML(
       '❌ Subcomando desconocido.\n\n' +
-      'Usa: <code>/session</code>, <code>/session backup</code>, ' +
-      '<code>/session restore</code>, <code>/session logout</code>'
+      'Usa: <code>/session</code>, <code>/session list</code>, ' +
+      '<code>/session backup</code>, <code>/session restore</code>, ' +
+      '<code>/session logout</code>'
     );
   } catch (e) {
     dbg('BOT', `Error en /session: ${e.message}`);
@@ -841,9 +935,10 @@ bot.action('help_session', async (ctx) => {
     await ctx.replyWithHTML(
       '🔐 <b>Sesión WhatsApp</b>\n\n' +
       '<code>/session</code> — Estado y QR\n' +
+      '<code>/session list</code> — Ver todas las sesiones\n' +
       '<code>/session backup</code> — Subir a GitHub\n' +
       '<code>/session restore</code> — Restaurar\n' +
-      '<code>/session logout</code> — Borrar'
+      '<code>/session logout</code> — Borrar todas'
     );
   } catch (e) {
     dbg('BOT', `Error help_session: ${e.message}`);
@@ -856,6 +951,10 @@ bot.action('help_session', async (ctx) => {
 
 bot.action('session_forceqr', async (ctx) => {
   try {
+    if (ctx.from.id !== config.telegram.adminId) {
+      return ctx.answerCbQuery('Solo admin');
+    }
+
     await ctx.answerCbQuery('Reiniciando cliente...');
 
     const msg = await ctx.reply(
@@ -887,19 +986,148 @@ bot.action('session_forceqr', async (ctx) => {
   }
 });
 
+// ══════════════════════════════════════════
+// ACCIÓN: Listar sesiones
+// ══════════════════════════════════════════
+
+bot.action('session_list', async (ctx) => {
+  try {
+    if (ctx.from.id !== config.telegram.adminId) {
+      return ctx.answerCbQuery('Solo admin');
+    }
+
+    await ctx.answerCbQuery('Listando...');
+    const sessionBackup = require('./session-backup');
+
+    const sessions = await sessionBackup.listSessions();
+
+    if (sessions.length === 0) {
+      return ctx.replyWithHTML(
+        '📦 <b>No hay sesiones guardadas</b>\n\n' +
+        '💡 Cuando conectes un WhatsApp, se guardará automáticamente.'
+      );
+    }
+
+    const currentInfo = whatsapp.getClient()?.info;
+    const currentPhone = currentInfo?.wid?.user;
+
+    const list = sessions
+      .map((s, i) => {
+        const isCurrent = currentPhone && s.phone === currentPhone;
+        const badge = isCurrent ? ' 🟢' : '';
+        return `${i + 1}. <code>${esc(s.pretty)}</code>${badge}`;
+      })
+      .join('\n');
+
+    const buttons = sessions.slice(0, 10).map(s => {
+      const label = s.phone ? prettyPhone(s.phone) : 'Legacy';
+      return [Markup.button.callback(`▶️ ${label}`, `sess_restore_${s.phone || 'legacy'}`)];
+    });
+
+    buttons.push([Markup.button.callback('❌ Cerrar', 'session_close')]);
+
+    await ctx.replyWithHTML(
+      `📦 <b>SESIONES GUARDADAS</b> (${sessions.length})\n\n${list}\n\n` +
+      `🟢 = Activa actualmente\n\n` +
+      `💡 Toca una para restaurar:`,
+      Markup.inlineKeyboard(buttons)
+    );
+  } catch (e) {
+    dbg('BOT', `Error session_list: ${e.message}`);
+    await ctx.reply(`❌ ${e.message}`).catch(() => {});
+  }
+});
+
+// ══════════════════════════════════════════
+// ACCIÓN: Restaurar sesión específica
+// ══════════════════════════════════════════
+
+bot.action(/^sess_restore_(.+)$/, async (ctx) => {
+  try {
+    if (ctx.from.id !== config.telegram.adminId) {
+      return ctx.answerCbQuery('Solo admin');
+    }
+
+    const phoneRaw = ctx.match[1];
+    const phone = phoneRaw === 'legacy' ? null : phoneRaw;
+
+    await ctx.answerCbQuery('Restaurando...');
+
+    const sessionBackup = require('./session-backup');
+    const label = phone ? prettyPhone(phone) : 'Legacy';
+
+    const msg = await ctx.reply(`🔄 Restaurando sesión ${label}...`);
+
+    const result = await sessionBackup.restoreSession(phone);
+
+    if (result.success) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, undefined,
+        `✅ <b>Sesión restaurada</b>\n\n` +
+        `📞 ${esc(label)}\n` +
+        `📁 ${result.fileCount} archivos\n` +
+        `📦 ${esc(result.filename)}\n\n` +
+        `⚠️ <b>Reinicia el bot</b> en Railway para usarla.`,
+        { parse_mode: 'HTML' }
+      );
+    } else {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, undefined,
+        `⚠️ <b>No se pudo restaurar</b>\n\n` +
+        `💡 ${esc(result.message || result.reason)}`,
+        { parse_mode: 'HTML' }
+      );
+    }
+  } catch (e) {
+    dbg('BOT', `Error restaurando sesión: ${e.message}`);
+    await ctx.reply(`❌ ${e.message}`).catch(() => {});
+  }
+});
+
+// ══════════════════════════════════════════
+// ACCIÓN: Cerrar menú
+// ══════════════════════════════════════════
+
+bot.action('session_close', async (ctx) => {
+  try {
+    await ctx.answerCbQuery('Cerrado');
+    await ctx.deleteMessage().catch(() => {});
+  } catch (e) {
+    dbg('BOT', `Error session_close: ${e.message}`);
+  }
+});
+
+// ══════════════════════════════════════════
+// ACCIÓN: Backup
+// ══════════════════════════════════════════
+
 bot.action('session_backup', async (ctx) => {
   try {
+    if (ctx.from.id !== config.telegram.adminId) {
+      return ctx.answerCbQuery('Solo admin');
+    }
+
     await ctx.answerCbQuery('Iniciando backup...');
     const sessionBackup = require('./session-backup');
 
-    const result = await sessionBackup.backupSession('Backup via botón [bot]');
+    const info = whatsapp.getClient()?.info;
+    const phone = info?.wid?.user;
+
+    const result = await sessionBackup.backupSession('Backup via botón [bot]', phone);
 
     if (result.success) {
+      const phoneLabel = result.phone ? prettyPhone(result.phone) : 'Legacy';
       await ctx.replyWithHTML(
-        `✅ Backup: ${result.sizeMB.toFixed(2)} MB (${result.fileCount} archivos)`
+        `✅ <b>Backup completado</b>\n\n` +
+        `📞 ${esc(phoneLabel)}\n` +
+        `📦 ${result.sizeMB.toFixed(2)} MB\n` +
+        `📁 ${result.fileCount} archivos`
       );
     } else {
-      await ctx.replyWithHTML(`⚠️ Falló: ${esc(result.reason)}`);
+      await ctx.replyWithHTML(
+        `⚠️ <b>No se pudo hacer backup</b>\n\n` +
+        `💡 ${esc(result.message || result.reason)}`
+      );
     }
   } catch (e) {
     dbg('BOT', `Error session_backup: ${e.message}`);
@@ -907,19 +1135,38 @@ bot.action('session_backup', async (ctx) => {
   }
 });
 
+// ══════════════════════════════════════════
+// ACCIÓN: Restore (genérico)
+// ══════════════════════════════════════════
+
 bot.action('session_restore', async (ctx) => {
   try {
+    if (ctx.from.id !== config.telegram.adminId) {
+      return ctx.answerCbQuery('Solo admin');
+    }
+
     await ctx.answerCbQuery('Restaurando...');
     const sessionBackup = require('./session-backup');
 
     const result = await sessionBackup.restoreSession();
 
     if (result.success) {
+      const phoneLabel = result.filename
+        ? (sessionBackup.phoneFromFilename(result.filename)
+            ? prettyPhone(sessionBackup.phoneFromFilename(result.filename))
+            : 'Legacy')
+        : 'N/A';
+
       await ctx.replyWithHTML(
-        `✅ Restaurada (${result.fileCount} archivos).\n💡 Reinicia el bot.`
+        `✅ <b>Restaurada</b> (${result.fileCount} archivos)\n` +
+        `📞 ${esc(phoneLabel)}\n\n` +
+        `⚠️ Reinicia el bot para aplicarla.`
       );
     } else {
-      await ctx.replyWithHTML(`⚠️ Falló: ${esc(result.reason)}`);
+      await ctx.replyWithHTML(
+        `⚠️ <b>No se pudo restaurar</b>\n\n` +
+        `💡 ${esc(result.message || result.reason)}`
+      );
     }
   } catch (e) {
     dbg('BOT', `Error session_restore: ${e.message}`);
@@ -927,10 +1174,33 @@ bot.action('session_restore', async (ctx) => {
   }
 });
 
+// ══════════════════════════════════════════
+// ACCIÓN: Logout
+// ══════════════════════════════════════════
+
 bot.action('session_logout', async (ctx) => {
   try {
+    if (ctx.from.id !== config.telegram.adminId) {
+      return ctx.answerCbQuery('Solo admin');
+    }
+
     await ctx.answerCbQuery();
-    await ctx.replyWithHTML('⚠️ Usa <code>/session logout</code> para confirmar.');
+
+    const keyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('⚠️ SÍ, borrar todo', 'session_logout_confirm'),
+        Markup.button.callback('❌ Cancelar', 'session_logout_cancel'),
+      ],
+    ]);
+
+    await ctx.replyWithHTML(
+      '⚠️ <b>¿Seguro?</b>\n\n' +
+      'Borrará TODAS las sesiones:\n' +
+      '• Local en Railway\n' +
+      '• Backups en GitHub\n\n' +
+      'Necesitarás escanear un QR nuevo.',
+      keyboard
+    );
   } catch (e) {
     dbg('BOT', `Error session_logout: ${e.message}`);
   }
@@ -938,10 +1208,14 @@ bot.action('session_logout', async (ctx) => {
 
 bot.action('session_logout_confirm', async (ctx) => {
   try {
+    if (ctx.from.id !== config.telegram.adminId) {
+      return ctx.answerCbQuery('Solo admin');
+    }
+
     await ctx.answerCbQuery('Borrando...');
     const sessionBackup = require('./session-backup');
     await sessionBackup.deleteSession();
-    await ctx.editMessageText('✅ Sesión eliminada. Reinicia el bot.').catch(() => {});
+    await ctx.editMessageText('✅ Todas las sesiones eliminadas. Reinicia el bot en Railway.').catch(() => {});
   } catch (e) {
     dbg('BOT', `Error session_logout_confirm: ${e.message}`);
     await ctx.reply(`❌ ${e.message}`).catch(() => {});
