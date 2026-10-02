@@ -1,7 +1,8 @@
 /**
- * BOT DE TELEGRAM
- * Maneja todos los comandos, autenticación y notificaciones
- * Acepta formato DDI + NÚMERO (separados o juntos)
+ * BOT DE TELEGRAM — VERSIÓN COMPLETA
+ * Acepta DDI + NÚMERO (juntos o separados)
+ * Usa HTML en lugar de Markdown (no rompe con caracteres especiales)
+ * Full debug + try/catch en cada comando
  */
 
 const { Telegraf, Markup } = require('telegraf');
@@ -12,17 +13,17 @@ const monitor = require('./monitor');
 const whatsapp = require('./whatsapp');
 
 // ══════════════════════════════════════════
-// INICIALIZAR BOT
+// HELPERS
 // ══════════════════════════════════════════
 
-const bot = new Telegraf(config.telegram.token);
+// Escapar HTML (evita errores 400 de Telegram)
+const esc = (s) =>
+  String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 
-// ══════════════════════════════════════════
-// HELPER: PARSEAR NÚMERO DE TELÉFONO
-// Acepta: "51 999999999" o "51999999999"
-// Devuelve: { ddi, number, phone } o null si inválido
-// ══════════════════════════════════════════
-
+// Parsear número: acepta "51 999999999" o "51999999999"
 function parsePhone(args) {
   if (!args || args.length === 0) return null;
 
@@ -30,19 +31,12 @@ function parsePhone(args) {
   let number = '';
 
   if (args.length >= 2) {
-    // Formato: /cmd 51 999999999
     ddi = args[0].replace(/\D/g, '');
     number = args[1].replace(/\D/g, '');
   } else {
-    // Formato: /cmd 51999999999
-    // Intentar separar DDI (1-3 dígitos) del número
     const raw = args[0].replace(/\D/g, '');
-
     if (raw.length < 8) return null;
 
-    // Heurística: si el total es >= 11, DDI de 2 dígitos.
-    // Si es >= 12, DDI de 3 dígitos (ej: 123 para USA/Canadá no aplica aquí).
-    // Ajusta según tu país. Por defecto asumimos 2 dígitos de DDI.
     if (raw.length >= 12) {
       ddi = raw.substring(0, 3);
       number = raw.substring(3);
@@ -52,16 +46,30 @@ function parsePhone(args) {
     }
   }
 
-  if (!ddi || !number) return null;
-  if (number.length < 6) return null;
+  if (!ddi || !number || number.length < 6) return null;
 
   return {
     ddi,
     number,
-    phone: `${ddi}${number}`, // ← formato para WhatsApp Web
+    phone: `${ddi}${number}`,
     pretty: `+${ddi} ${number}`,
   };
 }
+
+// Formatear un número ya concatenado
+function prettyPhone(raw) {
+  if (!raw) return 'N/A';
+  const ddi = raw.length >= 12 ? raw.substring(0, 3) : raw.substring(0, 2);
+  const number = raw.substring(ddi.length);
+  return `+${ddi} ${number}`;
+}
+
+// ══════════════════════════════════════════
+// INICIALIZAR BOT
+// ══════════════════════════════════════════
+
+const bot = new Telegraf(config.telegram.token);
+dbg('BOT', 'Bot inicializado');
 
 // ══════════════════════════════════════════
 // MIDDLEWARE DE AUTENTICACIÓN
@@ -71,250 +79,277 @@ bot.use(async (ctx, next) => {
   const userId = ctx.from?.id?.toString();
 
   if (!userId) {
-    return ctx.reply('❌ No se pudo identificar tu usuario.');
+    dbg('BOT', 'Usuario sin ID, ignorando');
+    return;
   }
 
+  // Admin siempre autorizado
   if (ctx.from.id === config.telegram.adminId) {
     return next();
   }
 
-  const auth = await github.isUserAuthorized(userId);
+  try {
+    const auth = await github.isUserAuthorized(userId);
 
-  if (!auth.authorized) {
-    const msg = [
-      '🔒 *ACCESO DENEGADO*',
-      '',
-      `❌ ${auth.reason}`,
-      '',
-      '💡 Solicita acceso al administrador.',
-      `📌 Tu ID de Telegram: \`${userId}\``,
-    ].join('\n');
+    if (!auth.authorized) {
+      const msg =
+        '🔒 <b>ACCESO DENEGADO</b>\n\n' +
+        `❌ ${esc(auth.reason)}\n\n` +
+        '💡 Solicita acceso al administrador.\n' +
+        `📌 Tu ID: <code>${esc(userId)}</code>`;
 
-    return ctx.reply(msg, { parse_mode: 'Markdown' });
+      return ctx.replyWithHTML(msg);
+    }
+
+    return next();
+  } catch (e) {
+    dbg('BOT', `Error verificando auth: ${e.message}`);
+    return ctx.reply('❌ Error verificando autorización. Intenta más tarde.');
   }
-
-  return next();
 });
 
 // ══════════════════════════════════════════
-// COMANDO: /start
+// /start
 // ══════════════════════════════════════════
 
 bot.start(async (ctx) => {
-  const userId = ctx.from.id;
-  const isAdmin = userId === config.telegram.adminId;
+  try {
+    const userId = ctx.from.id;
+    const isAdmin = userId === config.telegram.adminId;
+    dbg('BOT', `/start de ${userId}`);
 
-  const buttons = [
-    [
-      Markup.button.callback('📊 Estado', 'help_status'),
-      Markup.button.callback('➕ Monitorear', 'help_monitor'),
-    ],
-    [
-      Markup.button.callback('📋 Mi lista', 'help_list'),
-      Markup.button.callback('ℹ️ Ayuda', 'help_general'),
-    ],
-  ];
+    const buttons = [
+      [
+        Markup.button.callback('📊 Estado', 'help_status'),
+        Markup.button.callback('➕ Monitorear', 'help_monitor'),
+      ],
+      [
+        Markup.button.callback('📋 Mi lista', 'help_list'),
+        Markup.button.callback('ℹ️ Ayuda', 'help_general'),
+      ],
+    ];
 
-  if (isAdmin) {
-    buttons.push([Markup.button.callback('🔐 Sesión', 'help_session')]);
+    if (isAdmin) {
+      buttons.push([Markup.button.callback('🔐 Sesión', 'help_session')]);
+    }
+
+    const keyboard = Markup.inlineKeyboard(buttons);
+
+    const msg =
+      '👋 <b>¡Bienvenido a BanChecker Bot!</b>\n\n' +
+      '🔍 Verifico si números de WhatsApp están activos o baneados.\n\n' +
+      '📌 <b>Comandos:</b>\n' +
+      '<code>/status &lt;DDI&gt; &lt;NÚMERO&gt;</code> — Verifica un número\n' +
+      '<code>/monitoradd &lt;DDI&gt; &lt;NÚMERO&gt;</code> — Monitorea\n' +
+      '<code>/list</code> — Tus números monitoreados\n' +
+      '<code>/listban</code> — Números baneados\n' +
+      '<code>/help</code> — Ayuda completa\n' +
+      (isAdmin ? '<code>/session</code> — Gestión de sesión\n' : '') +
+      '\n' +
+      '💡 <b>Ejemplo:</b> <code>/status 51 999999999</code>\n\n' +
+      `🆔 Tu ID: <code>${esc(userId)}</code>`;
+
+    await ctx.replyWithHTML(msg, keyboard);
+  } catch (e) {
+    dbg('BOT', `Error en /start: ${e.message}`);
+    console.error(e);
   }
-
-  const keyboard = Markup.inlineKeyboard(buttons);
-
-  const msg = [
-    '👋 *¡Bienvenido a BanChecker Bot!*',
-    '',
-    '🔍 Verifico si números de WhatsApp están activos o baneados.',
-    '',
-    '📌 *Comandos:*',
-    '`/status <DDI> <NÚMERO>` — Verifica un número',
-    '`/monitoradd <DDI> <NÚMERO>` — Monitorea un número',
-    '`/list` — Tus números monitoreados',
-    '`/listban` — Números baneados',
-    '`/help` — Ayuda completa',
-    ...(isAdmin ? ['`/session` — Gestión de sesión WhatsApp'] : []),
-    '',
-    '💡 *Ejemplo:* `/status 51 999999999`',
-    '',
-    `🆔 *Tu ID:* \`${userId}\``,
-  ].join('\n');
-
-  await ctx.replyWithMarkdown(msg, keyboard);
 });
 
 // ══════════════════════════════════════════
-// COMANDO: /help
+// /help
 // ══════════════════════════════════════════
 
 bot.help(async (ctx) => {
-  const msg = [
-    '📖 *AYUDA COMPLETA — BanChecker Bot*',
-    '',
-    '🔹 *FORMATO DE NÚMEROS*',
-    'Siempre usa: `<DDI> <NÚMERO>` (con espacio)',
-    'O todo junto: `<DDI><NÚMERO>`',
-    '',
-    '✅ Correcto: `/status 51 999999999`',
-    '✅ Correcto: `/status 51999999999`',
-    '❌ Incorrecto: `/status +51 999-999-999`',
-    '❌ Incorrecto: `/status 999999999` (falta DDI)',
-    '',
-    '🌎 *DDI comunes:*',
-    '🇵🇪 Perú: `51`  |  🇲🇽 México: `52`  |  🇦🇷 Argentina: `54`',
-    '🇨🇴 Colombia: `57`  |  🇨🇱 Chile: `56`  |  🇪🇸 España: `34`',
-    '',
-    '🔹 *VERIFICACIÓN*',
-    '`/status 51 999999999` — Verifica el estado.',
-    '• ✅ Activo',
-    '• ⚠️ Baneo temporal (solicitar revisión)',
-    '• 🚫 Baneo por spam',
-    '• ❌ Baneo permanente (registrar nuevo)',
-    '',
-    '🔹 *MONITOREO*',
-    '`/monitoradd 51 999999999` — Agrega a tu lista.',
-    'El bot verificará cada 60s si es baneado.',
-    '`/list` — Ver tus números monitoreados.',
-    '`/listban` — Ver números baneados.',
-    '',
-    '🔹 *ADMIN*',
-    '`/add <id> <duración>` — Autoriza usuario (ej: 7d, 2h, 30m)',
-    '`/remove <id>` — Elimina usuario',
-    '`/session` — Gestión de sesión de WhatsApp',
-  ].join('\n');
+  try {
+    dbg('BOT', `/help de ${ctx.from.id}`);
 
-  await ctx.replyWithMarkdown(msg);
+    const msg =
+      '📖 <b>AYUDA COMPLETA</b>\n\n' +
+      '🔹 <b>FORMATO DE NÚMEROS</b>\n' +
+      'Usa: <code>&lt;DDI&gt; &lt;NÚMERO&gt;</code> (con espacio)\n' +
+      'O todo junto: <code>&lt;DDI&gt;&lt;NÚMERO&gt;</code>\n\n' +
+      '✅ <code>/status 51 999999999</code>\n' +
+      '✅ <code>/status 51999999999</code>\n' +
+      '❌ <code>/status +51 999-999-999</code>\n' +
+      '❌ <code>/status 999999999</code> (sin DDI)\n\n' +
+      '🌎 <b>DDI comunes:</b>\n' +
+      '🇵🇪 Perú: 51 | 🇲🇽 México: 52 | 🇦🇷 Argentina: 54\n' +
+      '🇨🇴 Colombia: 57 | 🇨🇱 Chile: 56 | 🇪🇸 España: 34\n\n' +
+      '🔹 <b>VERIFICACIÓN</b>\n' +
+      '<code>/status 51 999999999</code>\n' +
+      '• ✅ Activo\n' +
+      '• ⚠️ Baneo temporal (solicitar revisión)\n' +
+      '• 🚫 Baneo por spam\n' +
+      '• ❌ Baneo permanente\n\n' +
+      '🔹 <b>MONITOREO</b>\n' +
+      '<code>/monitoradd 51 999999999</code>\n' +
+      'Verificación cada 60 segundos.\n' +
+      '<code>/list</code> — Ver monitoreados\n' +
+      '<code>/listban</code> — Ver baneados\n\n' +
+      '🔹 <b>ADMIN</b>\n' +
+      '<code>/add &lt;id&gt; &lt;duración&gt;</code> — Autorizar (ej: 7d, 2h, 30m)\n' +
+      '<code>/remove &lt;id&gt;</code> — Eliminar usuario\n' +
+      '<code>/session</code> — Gestión de sesión WhatsApp';
+
+    await ctx.replyWithHTML(msg);
+  } catch (e) {
+    dbg('BOT', `Error en /help: ${e.message}`);
+    console.error(e);
+    await ctx.reply('❌ Error mostrando ayuda.').catch(() => {});
+  }
 });
 
 // ══════════════════════════════════════════
-// COMANDO: /status
+// /status
 // ══════════════════════════════════════════
 
 bot.command('status', async (ctx) => {
-  const args = ctx.message.text.split(/\s+/).slice(1);
+  const userId = ctx.from.id;
+  dbg('BOT', `/status de ${userId}`);
 
-  if (args.length === 0) {
-    return ctx.replyWithMarkdown(
-      '❌ *Uso incorrecto*\n\n' +
-      '`/status <DDI> <NÚMERO>`\n\n' +
-      'Ejemplos:\n' +
-      '`/status 51 999999999`\n' +
-      '`/status 51999999999`\n\n' +
-      '💡 El DDI es el código del país (ej: 51 para Perú).'
-    );
-  }
-
-  const parsed = parsePhone(args);
-
-  if (!parsed) {
-    return ctx.replyWithMarkdown(
-      '❌ *Número inválido*\n\n' +
-      'Asegúrate de incluir el DDI (código de país).\n\n' +
-      'Ejemplo: `/status 51 999999999`'
-    );
-  }
-
-  const { phone, pretty } = parsed;
-
-  const processingMsg = await ctx.reply(
-    `🔄 Verificando ${pretty}... Esto puede tomar unos segundos.`
-  );
+  let processingMsg = null;
 
   try {
+    const args = ctx.message.text.split(/\s+/).slice(1);
+
+    if (args.length === 0) {
+      return ctx.replyWithHTML(
+        '❌ <b>Uso incorrecto</b>\n\n' +
+        '<code>/status &lt;DDI&gt; &lt;NÚMERO&gt;</code>\n\n' +
+        'Ejemplos:\n' +
+        '<code>/status 51 999999999</code>\n' +
+        '<code>/status 51999999999</code>'
+      );
+    }
+
+    const parsed = parsePhone(args);
+
+    if (!parsed) {
+      return ctx.replyWithHTML(
+        '❌ <b>Número inválido</b>\n\n' +
+        'Incluye el DDI (código de país).\n\n' +
+        'Ejemplo: <code>/status 51 999999999</code>'
+      );
+    }
+
+    const { phone, pretty } = parsed;
+
+    processingMsg = await ctx.reply(
+      `🔄 Verificando ${pretty}... Esto puede tomar unos segundos.`
+    );
+
+    dbg('BOT', `Verificando ${phone}...`);
     const result = await whatsapp.checkNumberStatus(phone);
+    dbg('BOT', `Resultado: ${result.status}`);
 
     let emoji = '❓';
     let statusText = 'Desconocido';
 
     switch (result.status) {
-      case 'ACTIVE':         emoji = '✅'; statusText = 'Activo'; break;
-      case 'TEMPORARY_BAN':  emoji = '⚠️'; statusText = 'Baneo temporal'; break;
-      case 'SPAM_BAN':       emoji = '🚫'; statusText = 'Baneo por spam'; break;
-      case 'PERMANENT_BAN':  emoji = '❌'; statusText = 'Baneo permanente'; break;
-      case 'VERIFY':         emoji = '🔄'; statusText = 'Verificar'; break;
+      case 'ACTIVE':        emoji = '✅'; statusText = 'Activo'; break;
+      case 'TEMPORARY_BAN': emoji = '⚠️'; statusText = 'Baneo temporal'; break;
+      case 'SPAM_BAN':      emoji = '🚫'; statusText = 'Baneo por spam'; break;
+      case 'PERMANENT_BAN': emoji = '❌'; statusText = 'Baneo permanente'; break;
+      case 'VERIFY':        emoji = '🔄'; statusText = 'Verificar'; break;
+      case 'ERROR':         emoji = '💥'; statusText = 'Error'; break;
     }
 
-    const msg = [
-      `${emoji} *RESULTADO*`,
-      '',
-      `📱 *Número:* \`${pretty}\``,
-      `📊 *Estado:* ${statusText}`,
-      `💬 *Mensaje:* ${result.message}`,
-      '',
-      `⏰ ${new Date().toLocaleString('es-ES')}`,
-    ].join('\n');
+    const msg =
+      `${emoji} <b>RESULTADO</b>\n\n` +
+      `📱 Número: <code>${esc(pretty)}</code>\n` +
+      `📊 Estado: <b>${esc(statusText)}</b>\n` +
+      `💬 Mensaje: ${esc(result.message)}\n` +
+      `⏰ ${esc(new Date().toLocaleString('es-ES'))}`;
 
     await ctx.telegram.editMessageText(
       ctx.chat.id,
       processingMsg.message_id,
       undefined,
       msg,
-      { parse_mode: 'Markdown' }
-    );
+      { parse_mode: 'HTML' }
+    ).catch(async () => {
+      // Si editMessageText falla, enviamos uno nuevo
+      await ctx.replyWithHTML(msg);
+    });
   } catch (e) {
     dbg('BOT', `Error en /status: ${e.message}`);
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      processingMsg.message_id,
-      undefined,
-      `❌ *Error:* ${e.message}`,
-      { parse_mode: 'Markdown' }
-    );
-  }
-});
+    console.error(e);
 
-// ══════════════════════════════════════════
-// COMANDO: /monitoradd
-// ══════════════════════════════════════════
+    const errMsg = `❌ <b>Error:</b> ${esc(e.message)}`;
 
-bot.command('monitoradd', async (ctx) => {
-  const args = ctx.message.text.split(/\s+/).slice(1);
-
-  if (args.length === 0) {
-    return ctx.replyWithMarkdown(
-      '❌ *Uso incorrecto*\n\n' +
-      '`/monitoradd <DDI> <NÚMERO>`\n\n' +
-      'Ejemplos:\n' +
-      '`/monitoradd 51 999999999`\n' +
-      '`/monitoradd 51999999999`\n\n' +
-      '💡 Verificación cada 60 segundos.'
-    );
-  }
-
-  const parsed = parsePhone(args);
-
-  if (!parsed) {
-    return ctx.replyWithMarkdown(
-      '❌ *Número inválido*\n\n' +
-      'Incluye el DDI.\n\n' +
-      'Ejemplo: `/monitoradd 51 999999999`'
-    );
-  }
-
-  const { phone, pretty } = parsed;
-  const userId = ctx.from.id.toString();
-
-  const processingMsg = await ctx.reply(`🔄 Agregando ${pretty} a monitoreo...`);
-
-  try {
-    const check = await whatsapp.checkNumberStatus(phone);
-
-    if (check.status !== 'ACTIVE' && check.status !== 'VERIFY') {
+    if (processingMsg) {
       await ctx.telegram.editMessageText(
         ctx.chat.id,
         processingMsg.message_id,
         undefined,
-        `⚠️ *El número no está activo.*\n\n` +
-        `📊 Estado: ${check.message}\n\n` +
-        `💡 No se puede monitorear un número baneado.`,
-        { parse_mode: 'Markdown' }
+        errMsg,
+        { parse_mode: 'HTML' }
+      ).catch(() => ctx.replyWithHTML(errMsg).catch(() => {}));
+    } else {
+      await ctx.replyWithHTML(errMsg).catch(() => {});
+    }
+  }
+});
+
+// ══════════════════════════════════════════
+// /monitoradd
+// ══════════════════════════════════════════
+
+bot.command('monitoradd', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  dbg('BOT', `/monitoradd de ${userId}`);
+
+  let processingMsg = null;
+
+  try {
+    const args = ctx.message.text.split(/\s+/).slice(1);
+
+    if (args.length === 0) {
+      return ctx.replyWithHTML(
+        '❌ <b>Uso incorrecto</b>\n\n' +
+        '<code>/monitoradd &lt;DDI&gt; &lt;NÚMERO&gt;</code>\n\n' +
+        'Ejemplos:\n' +
+        '<code>/monitoradd 51 999999999</code>\n' +
+        '<code>/monitoradd 51999999999</code>\n\n' +
+        '💡 Verificación cada 60 segundos.'
       );
-      return;
     }
 
+    const parsed = parsePhone(args);
+
+    if (!parsed) {
+      return ctx.replyWithHTML(
+        '❌ <b>Número inválido</b>\n\n' +
+        'Incluye el DDI.\n\n' +
+        'Ejemplo: <code>/monitoradd 51 999999999</code>'
+      );
+    }
+
+    const { phone, pretty } = parsed;
+
+    processingMsg = await ctx.reply(`🔄 Verificando ${pretty}...`);
+
+    // Verificar primero que esté activo
+    const check = await whatsapp.checkNumberStatus(phone);
+
+    if (check.status !== 'ACTIVE' && check.status !== 'VERIFY') {
+      return ctx.telegram.editMessageText(
+        ctx.chat.id,
+        processingMsg.message_id,
+        undefined,
+        `⚠️ <b>El número no está activo</b>\n\n` +
+        `📊 Estado: ${esc(check.message)}\n\n` +
+        `💡 No se puede monitorear un número baneado.`,
+        { parse_mode: 'HTML' }
+      );
+    }
+
+    // Agregar al monitor
     const result = await monitor.addNumberToMonitor(userId, phone);
 
     if (!result.success) {
-      let reason = '';
+      let reason = 'Error desconocido';
       switch (result.reason) {
         case 'already_exists':
           reason = 'El número ya está en tu lista.';
@@ -322,242 +357,265 @@ bot.command('monitoradd', async (ctx) => {
         case 'already_suspended':
           reason = 'El número ya está marcado como suspendido.';
           break;
-        default:
-          reason = 'Error desconocido.';
       }
 
+      return ctx.telegram.editMessageText(
+        ctx.chat.id,
+        processingMsg.message_id,
+        undefined,
+        `⚠️ <b>No se pudo agregar</b>\n\n${esc(reason)}`,
+        { parse_mode: 'HTML' }
+      );
+    }
+
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      processingMsg.message_id,
+      undefined,
+      `✅ <b>Agregado a monitoreo</b>\n\n` +
+      `📱 <code>${esc(pretty)}</code>\n` +
+      `⏰ Verificación cada 60s\n\n` +
+      `💡 Recibirás notificación si es baneado.`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (e) {
+    dbg('BOT', `Error en /monitoradd: ${e.message}`);
+    console.error(e);
+
+    const errMsg = `❌ <b>Error:</b> ${esc(e.message)}`;
+
+    if (processingMsg) {
       await ctx.telegram.editMessageText(
         ctx.chat.id,
         processingMsg.message_id,
         undefined,
-        `⚠️ *No se pudo agregar*\n\n${reason}`,
-        { parse_mode: 'Markdown' }
-      );
-      return;
+        errMsg,
+        { parse_mode: 'HTML' }
+      ).catch(() => ctx.replyWithHTML(errMsg).catch(() => {}));
+    } else {
+      await ctx.replyWithHTML(errMsg).catch(() => {});
     }
-
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      processingMsg.message_id,
-      undefined,
-      `✅ *Agregado a monitoreo*\n\n` +
-      `📱 \`${pretty}\`\n` +
-      `⏰ Verificación cada 60s\n\n` +
-      `💡 Recibirás notificación si es baneado.`,
-      { parse_mode: 'Markdown' }
-    );
-  } catch (e) {
-    dbg('BOT', `Error en /monitoradd: ${e.message}`);
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      processingMsg.message_id,
-      undefined,
-      `❌ *Error:* ${e.message}`,
-      { parse_mode: 'Markdown' }
-    );
   }
 });
 
 // ══════════════════════════════════════════
-// COMANDO: /list
+// /list
 // ══════════════════════════════════════════
 
 bot.command('list', async (ctx) => {
   const userId = ctx.from.id.toString();
+  dbg('BOT', `/list de ${userId}`);
 
   try {
     const numbers = await monitor.getUserMonitoredNumbers(userId);
 
-    if (numbers.length === 0) {
-      return ctx.replyWithMarkdown(
-        '📋 *Tu lista está vacía.*\n\n' +
-        'Usa `/monitoradd 51 999999999` para agregar.'
+    if (!numbers || numbers.length === 0) {
+      return ctx.replyWithHTML(
+        '📋 <b>Tu lista está vacía.</b>\n\n' +
+        'Usa <code>/monitoradd 51 999999999</code> para agregar.'
       );
     }
 
-    const list = numbers.map((n, i) => {
-      // Formatear como +DDI NUMBER
-      const ddi = n.length >= 12 ? n.substring(0, 3) : n.substring(0, 2);
-      const number = n.substring(ddi.length);
-      return `${i + 1}. \`+${ddi} ${number}\``;
-    }).join('\n');
+    const list = numbers
+      .map((n, i) => `${i + 1}. <code>${esc(prettyPhone(n))}</code>`)
+      .join('\n');
 
-    await ctx.replyWithMarkdown(
-      `📋 *NÚMEROS MONITOREADOS*\n\n${list}\n\n` +
+    await ctx.replyWithHTML(
+      `📋 <b>NÚMEROS MONITOREADOS</b>\n\n${list}\n\n` +
       `📊 Total: ${numbers.length}`
     );
   } catch (e) {
     dbg('BOT', `Error en /list: ${e.message}`);
-    await ctx.reply(`❌ Error: ${e.message}`);
+    console.error(e);
+    await ctx.reply(`❌ Error: ${e.message}`).catch(() => {});
   }
 });
 
 // ══════════════════════════════════════════
-// COMANDO: /listban
+// /listban
 // ══════════════════════════════════════════
 
 bot.command('listban', async (ctx) => {
   const userId = ctx.from.id.toString();
+  dbg('BOT', `/listban de ${userId}`);
 
   try {
     const numbers = await monitor.getUserSuspendedNumbers(userId);
 
-    if (numbers.length === 0) {
-      return ctx.replyWithMarkdown(
-        '✅ *No hay números baneados.*\n\n' +
+    if (!numbers || numbers.length === 0) {
+      return ctx.replyWithHTML(
+        '✅ <b>No hay números baneados.</b>\n\n' +
         'Todos tus números están activos.'
       );
     }
 
-    const list = numbers.map((n, i) => {
-      const ddi = n.length >= 12 ? n.substring(0, 3) : n.substring(0, 2);
-      const number = n.substring(ddi.length);
-      return `${i + 1}. \`+${ddi} ${number}\``;
-    }).join('\n');
+    const list = numbers
+      .map((n, i) => `${i + 1}. <code>${esc(prettyPhone(n))}</code>`)
+      .join('\n');
 
-    await ctx.replyWithMarkdown(
-      `🚫 *NÚMEROS BANEADOS*\n\n${list}\n\n` +
+    await ctx.replyWithHTML(
+      `🚫 <b>NÚMEROS BANEADOS</b>\n\n${list}\n\n` +
       `📊 Total: ${numbers.length}`
     );
   } catch (e) {
     dbg('BOT', `Error en /listban: ${e.message}`);
-    await ctx.reply(`❌ Error: ${e.message}`);
+    console.error(e);
+    await ctx.reply(`❌ Error: ${e.message}`).catch(() => {});
   }
 });
 
 // ══════════════════════════════════════════
-// COMANDO ADMIN: /add
+// /add (SOLO ADMIN)
 // ══════════════════════════════════════════
 
 bot.command('add', async (ctx) => {
-  if (ctx.from.id !== config.telegram.adminId) {
-    return ctx.replyWithMarkdown('⛔ *Solo admin.*');
-  }
+  const userId = ctx.from.id;
+  dbg('BOT', `/add de ${userId}`);
 
-  const args = ctx.message.text.split(/\s+/).slice(1);
-
-  if (args.length < 2) {
-    return ctx.replyWithMarkdown(
-      '❌ *Uso:* `/add <id_usuario> <duración>`\n\n' +
-      'Ejemplos:\n' +
-      '`/add 123456789 7d` — 7 días\n' +
-      '`/add 123456789 2h` — 2 horas\n' +
-      '`/add 123456789 30m` — 30 minutos'
-    );
-  }
-
-  const targetId = args[0].replace(/\D/g, '');
-  const durationStr = args[1].toLowerCase();
-
-  let durationMs = 0;
-  const match = durationStr.match(/^(\d+)([mhd])$/);
-
-  if (!match) {
-    return ctx.replyWithMarkdown(
-      '❌ Formato inválido. Usa: `30m`, `2h`, `7d`'
-    );
-  }
-
-  const value = parseInt(match[1], 10);
-  const unit = match[2];
-
-  switch (unit) {
-    case 'm': durationMs = value * 60 * 1000; break;
-    case 'h': durationMs = value * 60 * 60 * 1000; break;
-    case 'd': durationMs = value * 24 * 60 * 60 * 1000; break;
+  if (userId !== config.telegram.adminId) {
+    return ctx.replyWithHTML('⛔ <b>Solo admin.</b>');
   }
 
   try {
+    const args = ctx.message.text.split(/\s+/).slice(1);
+
+    if (args.length < 2) {
+      return ctx.replyWithHTML(
+        '❌ <b>Uso:</b> <code>/add &lt;id&gt; &lt;duración&gt;</code>\n\n' +
+        'Ejemplos:\n' +
+        '<code>/add 123456789 7d</code> — 7 días\n' +
+        '<code>/add 123456789 2h</code> — 2 horas\n' +
+        '<code>/add 123456789 30m</code> — 30 minutos'
+      );
+    }
+
+    const targetId = args[0].replace(/\D/g, '');
+    const durationStr = args[1].toLowerCase();
+
+    const match = durationStr.match(/^(\d+)([mhd])$/);
+    if (!match) {
+      return ctx.replyWithHTML('❌ Formato inválido. Usa: <code>30m</code>, <code>2h</code>, <code>7d</code>');
+    }
+
+    const value = parseInt(match[1], 10);
+    const unit = match[2];
+
+    let durationMs = 0;
+    switch (unit) {
+      case 'm': durationMs = value * 60 * 1000; break;
+      case 'h': durationMs = value * 60 * 60 * 1000; break;
+      case 'd': durationMs = value * 24 * 60 * 60 * 1000; break;
+    }
+
     const user = await github.addAuthorizedUser(targetId, durationMs);
     const expiry = new Date(user.expiresAt).toLocaleString('es-ES');
 
-    await ctx.replyWithMarkdown(
-      `✅ *Usuario autorizado*\n\n` +
-      `🆔 \`${targetId}\`\n` +
-      `⏰ Expira: ${expiry}\n` +
-      `📅 Duración: ${durationStr}`
+    await ctx.replyWithHTML(
+      `✅ <b>Usuario autorizado</b>\n\n` +
+      `🆔 <code>${esc(targetId)}</code>\n` +
+      `⏰ Expira: ${esc(expiry)}\n` +
+      `📅 Duración: ${esc(durationStr)}`
     );
 
     dbg('BOT', `Usuario ${targetId} autorizado por ${durationStr}`);
   } catch (e) {
     dbg('BOT', `Error en /add: ${e.message}`);
-    await ctx.reply(`❌ Error: ${e.message}`);
+    console.error(e);
+    await ctx.reply(`❌ Error: ${e.message}`).catch(() => {});
   }
 });
 
 // ══════════════════════════════════════════
-// COMANDO ADMIN: /remove
+// /remove (SOLO ADMIN)
 // ══════════════════════════════════════════
 
 bot.command('remove', async (ctx) => {
-  if (ctx.from.id !== config.telegram.adminId) {
+  const userId = ctx.from.id;
+  dbg('BOT', `/remove de ${userId}`);
+
+  if (userId !== config.telegram.adminId) {
     return ctx.reply('⛔ Solo admin.');
   }
 
-  const args = ctx.message.text.split(/\s+/).slice(1);
-
-  if (args.length < 1) {
-    return ctx.replyWithMarkdown('❌ Uso: `/remove <id_usuario>`');
-  }
-
-  const targetId = args[0].replace(/\D/g, '');
-
   try {
+    const args = ctx.message.text.split(/\s+/).slice(1);
+
+    if (args.length < 1) {
+      return ctx.replyWithHTML('❌ Uso: <code>/remove &lt;id&gt;</code>');
+    }
+
+    const targetId = args[0].replace(/\D/g, '');
     await github.removeAuthorizedUser(targetId);
-    await ctx.replyWithMarkdown(`✅ Usuario \`${targetId}\` eliminado.`);
+
+    await ctx.replyWithHTML(`✅ Usuario <code>${esc(targetId)}</code> eliminado.`);
   } catch (e) {
-    await ctx.reply(`❌ Error: ${e.message}`);
+    dbg('BOT', `Error en /remove: ${e.message}`);
+    console.error(e);
+    await ctx.reply(`❌ Error: ${e.message}`).catch(() => {});
   }
 });
 
 // ══════════════════════════════════════════
-// COMANDO ADMIN: /session
+// /session (SOLO ADMIN)
 // ══════════════════════════════════════════
 
 bot.command('session', async (ctx) => {
-  if (ctx.from.id !== config.telegram.adminId) {
+  const userId = ctx.from.id;
+  dbg('BOT', `/session de ${userId}`);
+
+  if (userId !== config.telegram.adminId) {
     return ctx.reply('⛔ Solo admin.');
   }
 
-  const args = ctx.message.text.split(/\s+/).slice(1);
-  const subcommand = args[0]?.toLowerCase();
+  let sessionBackup, qrModule;
+  try {
+    sessionBackup = require('./session-backup');
+    qrModule = require('./qr');
+  } catch (e) {
+    dbg('BOT', `Error importando módulos: ${e.message}`);
+    return ctx.reply(`❌ Error interno: ${e.message}`);
+  }
 
-  const sessionBackup = require('./session-backup');
-  const qrModule = require('./qr');
+  try {
+    const args = ctx.message.text.split(/\s+/).slice(1);
+    const subcommand = args[0]?.toLowerCase();
 
-  // ── /session (estado)
-  if (!subcommand) {
-    try {
+    // ── /session (estado)
+    if (!subcommand) {
       const hasLocal = sessionBackup.hasLocalSession();
       const waReady = whatsapp.isReady();
       const info = whatsapp.getClient()?.info;
       const hasQR = qrModule.hasQR();
 
       const lines = [
-        '🔐 *ESTADO DE SESIÓN*',
+        '🔐 <b>ESTADO DE SESIÓN</b>',
         '',
         `📱 WhatsApp: ${waReady ? '✅ Conectado' : '❌ Desconectado'}`,
       ];
 
       if (info?.wid?.user) {
-        lines.push(`📞 Número: \`+${info.wid.user}\``);
-        lines.push(`👤 Nombre: ${info.pushname || 'N/A'}`);
+        lines.push(`📞 Número: <code>${esc(prettyPhone(info.wid.user))}</code>`);
+        lines.push(`👤 Nombre: ${esc(info.pushname || 'N/A')}`);
       }
 
       lines.push(`💾 Sesión local: ${hasLocal ? '✅' : '❌'}`);
 
       try {
         const remoteInfo = await sessionBackup.getRemoteBackupInfo();
-        lines.push(`☁️ Backup GitHub: ${remoteInfo ? `✅ ${remoteInfo.sizeMB.toFixed(2)} MB` : '❌'}`);
-      } catch {
+        if (remoteInfo) {
+          lines.push(`☁️ Backup GitHub: ✅ ${remoteInfo.sizeMB.toFixed(2)} MB`);
+        } else {
+          lines.push(`☁️ Backup GitHub: ❌`);
+        }
+      } catch (e) {
         lines.push(`☁️ Backup GitHub: ⚠️ Error`);
       }
 
       lines.push('');
-      lines.push('📋 *Subcomandos:*');
-      lines.push('`/session backup` — Subir a GitHub');
-      lines.push('`/session restore` — Restaurar desde GitHub');
-      lines.push('`/session logout` — Borrar sesión');
+      lines.push('📋 <b>Subcomandos:</b>');
+      lines.push('<code>/session backup</code> — Subir a GitHub');
+      lines.push('<code>/session restore</code> — Restaurar desde GitHub');
+      lines.push('<code>/session logout</code> — Borrar sesión');
 
       const keyboard = Markup.inlineKeyboard([
         [
@@ -567,93 +625,124 @@ bot.command('session', async (ctx) => {
         [Markup.button.callback('🚪 Logout', 'session_logout')],
       ]);
 
-      await ctx.replyWithMarkdown(lines.join('\n'), keyboard);
+      await ctx.replyWithHTML(lines.join('\n'), keyboard);
 
+      // Si hay QR pendiente, enviarlo
       if (hasQR) {
-        await ctx.replyWithPhoto(
-          { source: qrModule.getCurrentQRBuffer() },
-          {
-            caption: `📲 *QR PENDIENTE*\n\n⏰ ${qrModule.getCurrentQRTime()?.toLocaleString('es-ES')}\n\nEscanea con WhatsApp → Dispositivos vinculados`,
-            parse_mode: 'Markdown',
+        try {
+          const qrBuffer = qrModule.getCurrentQRBuffer();
+          if (qrBuffer) {
+            await ctx.replyWithPhoto(
+              { source: qrBuffer },
+              {
+                caption:
+                  `📲 <b>QR PENDIENTE</b>\n\n` +
+                  `⏰ ${esc(qrModule.getCurrentQRTime()?.toLocaleString('es-ES') || 'N/A')}\n\n` +
+                  `Escanea con WhatsApp → Dispositivos vinculados`,
+                parse_mode: 'HTML',
+              }
+            );
           }
-        );
+        } catch (e) {
+          dbg('BOT', `Error enviando QR: ${e.message}`);
+          await ctx.reply(`⚠️ No se pudo enviar el QR: ${e.message}`);
+        }
       }
-    } catch (e) {
-      dbg('BOT', `Error en /session: ${e.message}`);
-      await ctx.reply(`❌ Error: ${e.message}`);
+      return;
     }
-    return;
-  }
 
-  if (subcommand === 'backup') {
-    const msg = await ctx.reply('🔼 Subiendo sesión a GitHub...');
-    try {
-      const result = await sessionBackup.backupSession('Manual backup [bot]');
-      if (result.success) {
+    // ── /session backup
+    if (subcommand === 'backup') {
+      const msg = await ctx.reply('🔼 Subiendo sesión a GitHub...');
+
+      try {
+        const result = await sessionBackup.backupSession('Manual backup [bot]');
+
+        if (result.success) {
+          await ctx.telegram.editMessageText(
+            ctx.chat.id, msg.message_id, undefined,
+            `✅ <b>Backup completado</b>\n\n` +
+            `📦 ${result.sizeMB.toFixed(2)} MB\n` +
+            `📁 ${result.fileCount} archivos\n` +
+            `☁️ <code>logs/session.zip</code>`,
+            { parse_mode: 'HTML' }
+          );
+        } else {
+          await ctx.telegram.editMessageText(
+            ctx.chat.id, msg.message_id, undefined,
+            `⚠️ <b>Falló:</b> ${esc(result.reason)}${result.error ? '\n' + esc(result.error) : ''}`,
+            { parse_mode: 'HTML' }
+          );
+        }
+      } catch (e) {
         await ctx.telegram.editMessageText(
           ctx.chat.id, msg.message_id, undefined,
-          `✅ *Backup completado*\n\n📦 ${result.sizeMB.toFixed(2)} MB\n📁 ${result.fileCount} archivos\n☁️ \`logs/session.zip\``,
-          { parse_mode: 'Markdown' }
-        );
-      } else {
-        await ctx.telegram.editMessageText(
-          ctx.chat.id, msg.message_id, undefined,
-          `⚠️ *Falló:* ${result.reason}${result.error ? '\n' + result.error : ''}`,
-          { parse_mode: 'Markdown' }
-        );
+          `❌ ${esc(e.message)}`, { parse_mode: 'HTML' }
+        ).catch(() => {});
       }
-    } catch (e) {
-      await ctx.telegram.editMessageText(
-        ctx.chat.id, msg.message_id, undefined,
-        `❌ ${e.message}`, { parse_mode: 'Markdown' }
+      return;
+    }
+
+    // ── /session restore
+    if (subcommand === 'restore') {
+      const msg = await ctx.reply('🔽 Restaurando desde GitHub...');
+
+      try {
+        const result = await sessionBackup.restoreSession();
+
+        if (result.success) {
+          await ctx.telegram.editMessageText(
+            ctx.chat.id, msg.message_id, undefined,
+            `✅ <b>Sesión restaurada</b>\n\n` +
+            `📁 ${result.fileCount} archivos\n\n` +
+            `💡 Reinicia el bot para aplicarla.`,
+            { parse_mode: 'HTML' }
+          );
+        } else {
+          await ctx.telegram.editMessageText(
+            ctx.chat.id, msg.message_id, undefined,
+            `⚠️ <b>Falló:</b> ${esc(result.reason)}`,
+            { parse_mode: 'HTML' }
+          );
+        }
+      } catch (e) {
+        await ctx.telegram.editMessageText(
+          ctx.chat.id, msg.message_id, undefined,
+          `❌ ${esc(e.message)}`, { parse_mode: 'HTML' }
+        ).catch(() => {});
+      }
+      return;
+    }
+
+    // ── /session logout
+    if (subcommand === 'logout') {
+      const keyboard = Markup.inlineKeyboard([
+        [
+          Markup.button.callback('⚠️ SÍ, borrar', 'session_logout_confirm'),
+          Markup.button.callback('❌ Cancelar', 'session_logout_cancel'),
+        ],
+      ]);
+
+      return ctx.replyWithHTML(
+        '⚠️ <b>¿Seguro?</b>\n\n' +
+        'Borrará sesión local + GitHub.\n' +
+        'Necesitarás nuevo QR.\n\n' +
+        '¿Continuar?',
+        keyboard
       );
     }
-    return;
-  }
 
-  if (subcommand === 'restore') {
-    const msg = await ctx.reply('🔽 Restaurando desde GitHub...');
-    try {
-      const result = await sessionBackup.restoreSession();
-      if (result.success) {
-        await ctx.telegram.editMessageText(
-          ctx.chat.id, msg.message_id, undefined,
-          `✅ *Sesión restaurada*\n\n📁 ${result.fileCount} archivos\n\n💡 Reinicia el bot.`,
-          { parse_mode: 'Markdown' }
-        );
-      } else {
-        await ctx.telegram.editMessageText(
-          ctx.chat.id, msg.message_id, undefined,
-          `⚠️ *Falló:* ${result.reason}`,
-          { parse_mode: 'Markdown' }
-        );
-      }
-    } catch (e) {
-      await ctx.telegram.editMessageText(
-        ctx.chat.id, msg.message_id, undefined,
-        `❌ ${e.message}`, { parse_mode: 'Markdown' }
-      );
-    }
-    return;
-  }
-
-  if (subcommand === 'logout') {
-    const confirmKeyboard = Markup.inlineKeyboard([
-      [
-        Markup.button.callback('⚠️ SÍ, borrar', 'session_logout_confirm'),
-        Markup.button.callback('❌ Cancelar', 'session_logout_cancel'),
-      ],
-    ]);
-
-    return ctx.replyWithMarkdown(
-      '⚠️ *¿Seguro?*\n\nBorrará sesión local + GitHub.\nNecesitarás nuevo QR.\n\n¿Continuar?',
-      confirmKeyboard
+    // Subcomando desconocido
+    return ctx.replyWithHTML(
+      '❌ Subcomando desconocido.\n\n' +
+      'Usa: <code>/session</code>, <code>/session backup</code>, ' +
+      '<code>/session restore</code>, <code>/session logout</code>'
     );
+  } catch (e) {
+    dbg('BOT', `Error en /session: ${e.message}`);
+    console.error(e);
+    await ctx.reply(`❌ Error: ${e.message}`).catch(() => {});
   }
-
-  return ctx.replyWithMarkdown(
-    '❌ Subcomando desconocido.\n\nUsa: `/session`, `/session backup`, `/session restore`, `/session logout`'
-  );
 });
 
 // ══════════════════════════════════════════
@@ -661,105 +750,151 @@ bot.command('session', async (ctx) => {
 // ══════════════════════════════════════════
 
 bot.action('help_status', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.replyWithMarkdown(
-    '🔍 *Verificar número*\n\n' +
-    '`/status 51 999999999`\n\n' +
-    '💡 DDI + número, con espacio o junto.'
-  );
+  try {
+    await ctx.answerCbQuery();
+    await ctx.replyWithHTML(
+      '🔍 <b>Verificar número</b>\n\n' +
+      '<code>/status 51 999999999</code>\n\n' +
+      '💡 DDI + número, con espacio o junto.'
+    );
+  } catch (e) {
+    dbg('BOT', `Error help_status: ${e.message}`);
+  }
 });
 
 bot.action('help_monitor', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.replyWithMarkdown(
-    '➕ *Monitorear*\n\n' +
-    '`/monitoradd 51 999999999`\n\n' +
-    '💡 Verificación cada 60s.'
-  );
+  try {
+    await ctx.answerCbQuery();
+    await ctx.replyWithHTML(
+      '➕ <b>Monitorear</b>\n\n' +
+      '<code>/monitoradd 51 999999999</code>\n\n' +
+      '💡 Verificación cada 60s.'
+    );
+  } catch (e) {
+    dbg('BOT', `Error help_monitor: ${e.message}`);
+  }
 });
 
 bot.action('help_list', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.replyWithMarkdown(
-    '📋 *Listas*\n\n`/list` — Monitoreados\n`/listban` — Baneados'
-  );
+  try {
+    await ctx.answerCbQuery();
+    await ctx.replyWithHTML(
+      '📋 <b>Listas</b>\n\n' +
+      '<code>/list</code> — Monitoreados\n' +
+      '<code>/listban</code> — Baneados'
+    );
+  } catch (e) {
+    dbg('BOT', `Error help_list: ${e.message}`);
+  }
 });
 
 bot.action('help_general', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.replyWithMarkdown('ℹ️ Usa `/help` para la ayuda completa.');
+  try {
+    await ctx.answerCbQuery();
+    await ctx.replyWithHTML('ℹ️ Usa <code>/help</code> para la ayuda completa.');
+  } catch (e) {
+    dbg('BOT', `Error help_general: ${e.message}`);
+  }
 });
 
 bot.action('help_session', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.replyWithMarkdown(
-    '🔐 *Sesión WhatsApp*\n\n' +
-    '`/session` — Estado y QR\n' +
-    '`/session backup` — Subir a GitHub\n' +
-    '`/session restore` — Restaurar\n' +
-    '`/session logout` — Borrar'
-  );
+  try {
+    await ctx.answerCbQuery();
+    await ctx.replyWithHTML(
+      '🔐 <b>Sesión WhatsApp</b>\n\n' +
+      '<code>/session</code> — Estado y QR\n' +
+      '<code>/session backup</code> — Subir a GitHub\n' +
+      '<code>/session restore</code> — Restaurar\n' +
+      '<code>/session logout</code> — Borrar'
+    );
+  } catch (e) {
+    dbg('BOT', `Error help_session: ${e.message}`);
+  }
 });
 
 bot.action('session_backup', async (ctx) => {
-  await ctx.answerCbQuery('Iniciando backup...');
-  const sessionBackup = require('./session-backup');
   try {
+    await ctx.answerCbQuery('Iniciando backup...');
+    const sessionBackup = require('./session-backup');
+
     const result = await sessionBackup.backupSession('Backup via botón [bot]');
+
     if (result.success) {
-      await ctx.replyWithMarkdown(`✅ Backup: ${result.sizeMB.toFixed(2)} MB (${result.fileCount} archivos)`);
+      await ctx.replyWithHTML(
+        `✅ Backup: ${result.sizeMB.toFixed(2)} MB (${result.fileCount} archivos)`
+      );
     } else {
-      await ctx.replyWithMarkdown(`⚠️ Falló: ${result.reason}`);
+      await ctx.replyWithHTML(`⚠️ Falló: ${esc(result.reason)}`);
     }
   } catch (e) {
-    await ctx.reply(`❌ ${e.message}`);
+    dbg('BOT', `Error session_backup: ${e.message}`);
+    await ctx.reply(`❌ ${e.message}`).catch(() => {});
   }
 });
 
 bot.action('session_restore', async (ctx) => {
-  await ctx.answerCbQuery('Restaurando...');
-  const sessionBackup = require('./session-backup');
   try {
+    await ctx.answerCbQuery('Restaurando...');
+    const sessionBackup = require('./session-backup');
+
     const result = await sessionBackup.restoreSession();
+
     if (result.success) {
-      await ctx.replyWithMarkdown(`✅ Restaurada (${result.fileCount} archivos).\n💡 Reinicia el bot.`);
+      await ctx.replyWithHTML(
+        `✅ Restaurada (${result.fileCount} archivos).\n💡 Reinicia el bot.`
+      );
     } else {
-      await ctx.replyWithMarkdown(`⚠️ Falló: ${result.reason}`);
+      await ctx.replyWithHTML(`⚠️ Falló: ${esc(result.reason)}`);
     }
   } catch (e) {
-    await ctx.reply(`❌ ${e.message}`);
+    dbg('BOT', `Error session_restore: ${e.message}`);
+    await ctx.reply(`❌ ${e.message}`).catch(() => {});
   }
 });
 
 bot.action('session_logout', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.replyWithMarkdown('⚠️ Usa `/session logout` para confirmar.');
+  try {
+    await ctx.answerCbQuery();
+    await ctx.replyWithHTML('⚠️ Usa <code>/session logout</code> para confirmar.');
+  } catch (e) {
+    dbg('BOT', `Error session_logout: ${e.message}`);
+  }
 });
 
 bot.action('session_logout_confirm', async (ctx) => {
-  await ctx.answerCbQuery('Borrando...');
-  const sessionBackup = require('./session-backup');
   try {
+    await ctx.answerCbQuery('Borrando...');
+    const sessionBackup = require('./session-backup');
     await sessionBackup.deleteSession();
-    await ctx.editMessageText('✅ Sesión eliminada. Reinicia el bot.');
+    await ctx.editMessageText('✅ Sesión eliminada. Reinicia el bot.').catch(() => {});
   } catch (e) {
-    await ctx.reply(`❌ ${e.message}`);
+    dbg('BOT', `Error session_logout_confirm: ${e.message}`);
+    await ctx.reply(`❌ ${e.message}`).catch(() => {});
   }
 });
 
 bot.action('session_logout_cancel', async (ctx) => {
-  await ctx.answerCbQuery('Cancelado');
-  await ctx.editMessageText('❌ Cancelado.');
+  try {
+    await ctx.answerCbQuery('Cancelado');
+    await ctx.editMessageText('❌ Cancelado.').catch(() => {});
+  } catch (e) {
+    dbg('BOT', `Error session_logout_cancel: ${e.message}`);
+  }
 });
 
 // ══════════════════════════════════════════
-// MANEJO DE ERRORES
+// MANEJO DE ERRORES GLOBAL
 // ══════════════════════════════════════════
 
 bot.catch((err, ctx) => {
-  dbg('BOT', `❌ Error: ${err.message}`);
+  dbg('BOT', `❌ Error no manejado: ${err.message}`);
   console.error('Error en bot:', err);
-  try { ctx.reply('❌ Error inesperado.'); } catch {}
+
+  try {
+    if (ctx) {
+      ctx.reply('❌ Error inesperado. Intenta de nuevo.').catch(() => {});
+    }
+  } catch {}
 });
 
 // ══════════════════════════════════════════
