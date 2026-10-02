@@ -1,8 +1,6 @@
 /**
  * BOT DE TELEGRAM — VERSIÓN COMPLETA
- * Acepta DDI + NÚMERO (juntos o separados)
- * Usa HTML en lugar de Markdown (no rompe con caracteres especiales)
- * Full debug + try/catch en cada comando
+ * HTML en lugar de Markdown, try/catch en todo, /session fuerza QR
  */
 
 const { Telegraf, Markup } = require('telegraf');
@@ -16,14 +14,12 @@ const whatsapp = require('./whatsapp');
 // HELPERS
 // ══════════════════════════════════════════
 
-// Escapar HTML (evita errores 400 de Telegram)
 const esc = (s) =>
   String(s ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 
-// Parsear número: acepta "51 999999999" o "51999999999"
 function parsePhone(args) {
   if (!args || args.length === 0) return null;
 
@@ -56,7 +52,6 @@ function parsePhone(args) {
   };
 }
 
-// Formatear un número ya concatenado
 function prettyPhone(raw) {
   if (!raw) return 'N/A';
   const ddi = raw.length >= 12 ? raw.substring(0, 3) : raw.substring(0, 2);
@@ -83,7 +78,6 @@ bot.use(async (ctx, next) => {
     return;
   }
 
-  // Admin siempre autorizado
   if (ctx.from.id === config.telegram.adminId) {
     return next();
   }
@@ -269,7 +263,6 @@ bot.command('status', async (ctx) => {
       msg,
       { parse_mode: 'HTML' }
     ).catch(async () => {
-      // Si editMessageText falla, enviamos uno nuevo
       await ctx.replyWithHTML(msg);
     });
   } catch (e) {
@@ -330,7 +323,6 @@ bot.command('monitoradd', async (ctx) => {
 
     processingMsg = await ctx.reply(`🔄 Verificando ${pretty}...`);
 
-    // Verificar primero que esté activo
     const check = await whatsapp.checkNumberStatus(phone);
 
     if (check.status !== 'ACTIVE' && check.status !== 'VERIFY') {
@@ -345,7 +337,6 @@ bot.command('monitoradd', async (ctx) => {
       );
     }
 
-    // Agregar al monitor
     const result = await monitor.addNumberToMonitor(userId, phone);
 
     if (!result.success) {
@@ -580,18 +571,63 @@ bot.command('session', async (ctx) => {
     const args = ctx.message.text.split(/\s+/).slice(1);
     const subcommand = args[0]?.toLowerCase();
 
-    // ── /session (estado)
+    // ══════════════════════════════════════════
+    // /session (estado + QR automático)
+    // ══════════════════════════════════════════
     if (!subcommand) {
       const hasLocal = sessionBackup.hasLocalSession();
       const waReady = whatsapp.isReady();
       const info = whatsapp.getClient()?.info;
       const hasQR = qrModule.hasQR();
+      const diag = whatsapp.getDiagnostics();
 
+      // SI NO ESTÁ CONECTADO NI HAY QR → FORZAR QR
+      if (!waReady && !hasQR) {
+        const msg = await ctx.reply(
+          '🔄 Generando QR... Esto puede tardar 1-2 minutos.\n\n' +
+          '⚠️ Si ya tenías una sesión, se va a borrar.\n\n' +
+          '⏳ Espera...'
+        );
+
+        try {
+          dbg('BOT', 'Forzando restart para generar QR...');
+          await whatsapp.restartForQR();
+
+          await ctx.telegram.editMessageText(
+            ctx.chat.id, msg.message_id, undefined,
+            '✅ Cliente reiniciado.\n\n' +
+            '⏳ Esperando que WhatsApp genere el QR...\n' +
+            'Cuando aparezca, te lo enviaré automáticamente.\n\n' +
+            'Si pasan 2 minutos sin respuesta, vuelve a usar /session.',
+            { parse_mode: 'HTML' }
+          );
+        } catch (e) {
+          dbg('BOT', `Error forzando QR: ${e.message}`);
+          await ctx.telegram.editMessageText(
+            ctx.chat.id, msg.message_id, undefined,
+            `❌ Error al generar QR: ${esc(e.message)}`,
+            { parse_mode: 'HTML' }
+          );
+        }
+        return;
+      }
+
+      // ESTADO NORMAL
       const lines = [
         '🔐 <b>ESTADO DE SESIÓN</b>',
         '',
         `📱 WhatsApp: ${waReady ? '✅ Conectado' : '❌ Desconectado'}`,
+        `🔧 Inicializando: ${diag.initializing ? '⏳ Sí' : 'No'}`,
+        `📡 Último evento: <code>${esc(diag.lastEvent)}</code>`,
       ];
+
+      if (diag.initElapsedSec) {
+        lines.push(`⏱️ Tiempo init: ${diag.initElapsedSec}s`);
+      }
+
+      if (diag.initError) {
+        lines.push(`❌ Error: ${esc(diag.initError)}`);
+      }
 
       if (info?.wid?.user) {
         lines.push(`📞 Número: <code>${esc(prettyPhone(info.wid.user))}</code>`);
@@ -599,6 +635,7 @@ bot.command('session', async (ctx) => {
       }
 
       lines.push(`💾 Sesión local: ${hasLocal ? '✅' : '❌'}`);
+      lines.push(`📲 QR pendiente: ${hasQR ? '✅' : '❌'}`);
 
       try {
         const remoteInfo = await sessionBackup.getRemoteBackupInfo();
@@ -613,21 +650,24 @@ bot.command('session', async (ctx) => {
 
       lines.push('');
       lines.push('📋 <b>Subcomandos:</b>');
+      lines.push('<code>/session</code> — Ver estado (o generar QR)');
       lines.push('<code>/session backup</code> — Subir a GitHub');
       lines.push('<code>/session restore</code> — Restaurar desde GitHub');
       lines.push('<code>/session logout</code> — Borrar sesión');
 
       const keyboard = Markup.inlineKeyboard([
         [
+          Markup.button.callback('🔐 Generar QR', 'session_forceqr'),
           Markup.button.callback('☁️ Backup', 'session_backup'),
-          Markup.button.callback('🔽 Restore', 'session_restore'),
         ],
-        [Markup.button.callback('🚪 Logout', 'session_logout')],
+        [
+          Markup.button.callback('🔽 Restore', 'session_restore'),
+          Markup.button.callback('🚪 Logout', 'session_logout'),
+        ],
       ]);
 
       await ctx.replyWithHTML(lines.join('\n'), keyboard);
 
-      // Si hay QR pendiente, enviarlo
       if (hasQR) {
         try {
           const qrBuffer = qrModule.getCurrentQRBuffer();
@@ -645,7 +685,6 @@ bot.command('session', async (ctx) => {
           }
         } catch (e) {
           dbg('BOT', `Error enviando QR: ${e.message}`);
-          await ctx.reply(`⚠️ No se pudo enviar el QR: ${e.message}`);
         }
       }
       return;
@@ -732,7 +771,6 @@ bot.command('session', async (ctx) => {
       );
     }
 
-    // Subcomando desconocido
     return ctx.replyWithHTML(
       '❌ Subcomando desconocido.\n\n' +
       'Usa: <code>/session</code>, <code>/session backup</code>, ' +
@@ -809,6 +847,43 @@ bot.action('help_session', async (ctx) => {
     );
   } catch (e) {
     dbg('BOT', `Error help_session: ${e.message}`);
+  }
+});
+
+// ══════════════════════════════════════════
+// ACCIÓN: Forzar QR
+// ══════════════════════════════════════════
+
+bot.action('session_forceqr', async (ctx) => {
+  try {
+    await ctx.answerCbQuery('Reiniciando cliente...');
+
+    const msg = await ctx.reply(
+      '🔄 Reiniciando cliente de WhatsApp...\n\n' +
+      '⏳ Esto puede tardar 1-2 minutos.\n' +
+      'Cuando el QR esté listo, te lo enviaré automáticamente.'
+    );
+
+    try {
+      await whatsapp.restartForQR();
+
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, undefined,
+        '✅ Cliente reiniciado.\n\n' +
+        '⏳ Esperando QR de WhatsApp...\n\n' +
+        'Debería llegarte en 1-2 minutos.',
+        { parse_mode: 'HTML' }
+      );
+    } catch (e) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msg.message_id, undefined,
+        `❌ Error: ${esc(e.message)}`,
+        { parse_mode: 'HTML' }
+      );
+    }
+  } catch (e) {
+    dbg('BOT', `Error session_forceqr: ${e.message}`);
+    await ctx.reply(`❌ ${e.message}`).catch(() => {});
   }
 });
 
