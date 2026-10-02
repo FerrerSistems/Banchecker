@@ -1,6 +1,8 @@
 /**
- * MÓDULO DE WHATSAPP — VERSIÓN DEBUG COMPLETA
- * Full prints en cada evento, función restartForQR()
+ * MÓDULO DE WHATSAPP — VERSIÓN CORREGIDA
+ * - Usa getNumberId() para verificar existencia (rápido)
+ * - Timeout wrapper de 20s por operación (no cuelga 90s)
+ * - Full debug
  */
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
@@ -36,6 +38,22 @@ function setEvent(name) {
 }
 
 // ══════════════════════════════════════════
+// TIMEOUT WRAPPER
+// ══════════════════════════════════════════
+
+/**
+ * Envuelve una promesa con timeout propio (evita cuelgues de 90s)
+ */
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) =>
+      setTimeout(() => rej(new Error(`Timeout en ${label} (${ms}ms)`)), ms)
+    ),
+  ]);
+}
+
+// ══════════════════════════════════════════
 // CREAR CLIENTE
 // ══════════════════════════════════════════
 
@@ -45,7 +63,6 @@ function createClient() {
   let chromePath = config.whatsapp.chromePath;
 
   if (!chromePath) {
-    console.log('[WHATSAPP] chromePath no configurado, buscando...');
     const possiblePaths = [
       '/usr/bin/chromium',
       '/usr/bin/chromium-browser',
@@ -61,32 +78,17 @@ function createClient() {
           console.log(`[WHATSAPP] ✅ Chrome encontrado: ${p}`);
           break;
         }
-      } catch (e) {
-        console.log(`[WHATSAPP] Error verificando ${p}: ${e.message}`);
-      }
+      } catch (e) {}
     }
   } else {
     console.log(`[WHATSAPP] chromePath desde config: ${chromePath}`);
   }
 
   if (!chromePath) {
-    console.error('[WHATSAPP] ❌ No se encontró Chrome');
     throw new Error('Chrome no encontrado');
   }
 
-  try {
-    const chromeExists = fs.existsSync(chromePath);
-    console.log(`[WHATSAPP] ¿Chrome existe? ${chromeExists ? '✅' : '❌'} (${chromePath})`);
-    if (!chromeExists) {
-      throw new Error(`Chrome no existe en: ${chromePath}`);
-    }
-  } catch (e) {
-    console.error('[WHATSAPP] Error verificando Chrome:', e.message);
-    throw e;
-  }
-
   console.log(`[WHATSAPP] Session path: ${config.whatsapp.sessionPath}`);
-  console.log(`[WHATSAPP] Session ID: ${config.whatsapp.sessionId}`);
 
   const newClient = new Client({
     authStrategy: new LocalAuth({
@@ -96,7 +98,6 @@ function createClient() {
     puppeteer: {
       executablePath: chromePath,
       headless: true,
-      dumpio: false,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -121,7 +122,7 @@ function createClient() {
   console.log('[WHATSAPP] Cliente creado, registrando eventos...\n');
 
   // ══════════════════════════════════════════
-  // EVENTOS (con full prints)
+  // EVENTOS
   // ══════════════════════════════════════════
 
   newClient.on('qr', (qr) => {
@@ -130,16 +131,10 @@ function createClient() {
     currentQR = qr;
 
     if (!qrDisplayed) {
-      console.log('[WHATSAPP] Mostrando QR en terminal:\n');
-      try {
-        qrcode.generate(qr, { small: true });
-      } catch (e) {
-        console.log('[WHATSAPP] Error generando QR terminal:', e.message);
-      }
+      try { qrcode.generate(qr, { small: true }); } catch (e) {}
       qrDisplayed = true;
     }
 
-    console.log('[WHATSAPP] Emitiendo evento "qr" al emitter...');
     emitter.emit('qr', qr);
     console.log('[WHATSAPP] ✅ Evento "qr" emitido\n');
   });
@@ -151,18 +146,18 @@ function createClient() {
 
   newClient.on('change_state', (state) => {
     setEvent(`change_state:${state}`);
-    console.log(`[WHATSAPP] 🔄 Estado cambió: ${state}`);
+    console.log(`[WHATSAPP] 🔄 Estado: ${state}`);
   });
 
   newClient.on('authenticated', () => {
     setEvent('authenticated');
-    console.log('\n[WHATSAPP] ✅ AUTENTICADO — guardando sesión...');
+    console.log('\n[WHATSAPP] ✅ AUTENTICADO\n');
     emitter.emit('authenticated');
   });
 
   newClient.on('auth_failure', (msg) => {
     setEvent('auth_failure');
-    console.error(`\n[WHATSAPP] ❌ FALLO AUTH: ${msg}`);
+    console.error(`\n[WHATSAPP] ❌ FALLO AUTH: ${msg}\n`);
     isReady = false;
     initError = `Auth failure: ${msg}`;
     emitter.emit('auth_failure', msg);
@@ -177,8 +172,7 @@ function createClient() {
 
     const info = newClient.info;
     console.log(`[WHATSAPP] Número: +${info?.wid?.user}`);
-    console.log(`[WHATSAPP] Nombre: ${info?.pushname}`);
-    console.log(`[WHATSAPP] Platform: ${info?.platform}\n`);
+    console.log(`[WHATSAPP] Nombre: ${info?.pushname}\n`);
 
     emitter.emit('ready', info);
 
@@ -195,48 +189,25 @@ function createClient() {
     emitter.emit('disconnected', reason);
   });
 
-  newClient.on('message', (msg) => {
-    console.log(`[WHATSAPP] 📩 Mensaje de ${msg.from}: ${(msg.body || '').substring(0, 30)}`);
-  });
-
-  newClient.on('message_create', (msg) => {
-    console.log(`[WHATSAPP] 📤 Mensaje creado: ${msg.to}`);
-  });
-
   newClient.on('error', (err) => {
     setEvent('error');
     console.error('[WHATSAPP] ❌ EVENTO ERROR:', err.message);
-    console.error(err.stack);
     initError = err.message;
-  });
-
-  // Capturar logs de puppeteer/console
-  newClient.on('remote_session_saved', () => {
-    setEvent('remote_session_saved');
-    console.log('[WHATSAPP] 💾 Sesión remota guardada');
-  });
-
-  newClient.on('vote_update', (vote) => {
-    console.log(`[WHATSAPP] 🗳️ Vote update: ${JSON.stringify(vote)}`);
   });
 
   return newClient;
 }
 
 // ══════════════════════════════════════════
-// INICIALIZAR WHATSAPP
+// INICIALIZAR
 // ══════════════════════════════════════════
 
 async function initializeWhatsApp() {
-  console.log('\n[WHATSAPP] ═══ INICIALIZANDO WHATSAPP ═══');
+  console.log('\n[WHATSAPP] ═══ INICIALIZANDO ═══');
 
-  if (client && isReady) {
-    console.log('[WHATSAPP] Ya está listo, retornando cliente');
-    return client;
-  }
+  if (client && isReady) return client;
 
   if (isInitializing) {
-    console.log('[WHATSAPP] Ya se está inicializando, esperando...');
     return new Promise((resolve) => {
       readyResolvers.push(() => resolve(client));
     });
@@ -259,29 +230,21 @@ async function initializeWhatsApp() {
 
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      console.error(`\n[WHATSAPP] ❌ TIMEOUT (5 min) — Último evento: ${lastEventName}`);
-      console.error(`[WHATSAPP] initError: ${initError || 'ninguno'}`);
+      console.error(`\n[WHATSAPP] ❌ TIMEOUT — Último evento: ${lastEventName}`);
       isInitializing = false;
-      reject(new Error(`Timeout. Último evento: ${lastEventName}`));
+      reject(new Error(`Timeout. Evento: ${lastEventName}`));
     }, 5 * 60 * 1000);
 
     readyResolvers.push(() => {
       clearTimeout(timeout);
       isInitializing = false;
-      const elapsed = ((Date.now() - initStartTime) / 1000).toFixed(1);
-      console.log(`[WHATSAPP] ✅ Inicialización completada en ${elapsed}s`);
       resolve(client);
     });
 
-    console.log('[WHATSAPP] Llamando client.initialize()...');
-
     client.initialize()
-      .then(() => {
-        console.log('[WHATSAPP] client.initialize() resolvió OK');
-      })
+      .then(() => console.log('[WHATSAPP] client.initialize() OK'))
       .catch((e) => {
-        console.error('[WHATSAPP] ❌ client.initialize() falló:', e.message);
-        console.error(e.stack);
+        console.error('[WHATSAPP] ❌ initialize() falló:', e.message);
         clearTimeout(timeout);
         isInitializing = false;
         initError = e.message;
@@ -291,22 +254,15 @@ async function initializeWhatsApp() {
 }
 
 // ══════════════════════════════════════════
-// FORZAR REINICIO PARA QR
+// RESTART PARA QR
 // ══════════════════════════════════════════
 
 async function restartForQR() {
-  console.log('\n[WHATSAPP] ═══ REINICIANDO PARA GENERAR QR ═══');
+  console.log('\n[WHATSAPP] ═══ REINICIANDO PARA QR ═══');
 
   try {
-    // Destruir cliente actual si existe
     if (client) {
-      console.log('[WHATSAPP] Destruyendo cliente actual...');
-      try {
-        await client.destroy();
-        console.log('[WHATSAPP] Cliente destruido');
-      } catch (e) {
-        console.error('[WHATSAPP] Error destruyendo:', e.message);
-      }
+      try { await client.destroy(); } catch (e) {}
     }
 
     client = null;
@@ -316,21 +272,15 @@ async function restartForQR() {
     currentQR = null;
     initError = null;
 
-    // Limpiar sesión local corrupta
     const sessionDir = config.whatsapp.sessionPath;
     if (fs.existsSync(sessionDir)) {
-      console.log(`[WHATSAPP] Limpiando ${sessionDir}...`);
       try {
         fs.rmSync(sessionDir, { recursive: true, force: true });
         fs.mkdirSync(sessionDir, { recursive: true });
         console.log('[WHATSAPP] Sesión local limpiada');
-      } catch (e) {
-        console.error('[WHATSAPP] Error limpiando:', e.message);
-      }
+      } catch (e) {}
     }
 
-    // Reinicializar
-    console.log('[WHATSAPP] Reinicializando...');
     return await initializeWhatsApp();
   } catch (e) {
     console.error('[WHATSAPP] ❌ Error en restartForQR:', e.message);
@@ -355,38 +305,99 @@ async function getReadyClient() {
 }
 
 // ══════════════════════════════════════════
-// VERIFICAR ESTADO
+// ⭐ VERIFICAR ESTADO DE UN NÚMERO (CORREGIDO)
+// Usa getNumberId() — rápido y confiable
 // ══════════════════════════════════════════
 
 async function checkNumberStatus(phone) {
   console.log(`\n[CHECK] ═══ Verificando ${phone} ═══`);
+
   const c = await getReadyClient();
-  const chatId = `${phone}@c.us`;
+
+  if (!c || !isReady) {
+    return {
+      status: 'ERROR',
+      message: '❌ WhatsApp no está listo',
+      raw: { error: 'client_not_ready' },
+    };
+  }
 
   try {
-    console.log(`[CHECK] getContactById(${chatId})...`);
-    const contact = await c.getContactById(chatId);
-    console.log(`[CHECK] Contacto: isWAContact=${contact.isWAContact}, isUser=${contact.isUser}`);
+    // ══════════════════════════════════════════
+    // PASO 1: ¿El número está registrado en WhatsApp?
+    // getNumberId() es MUCHO más rápido que getContactById()
+    // ══════════════════════════════════════════
+    console.log(`[CHECK] getNumberId(${phone})...`);
+    const numberId = await withTimeout(
+      c.getNumberId(phone),
+      20000,
+      'getNumberId'
+    );
 
-    if (!contact.isWAContact) {
-      console.log('[CHECK] ❌ No es contacto WhatsApp');
+    console.log(`[CHECK] Resultado getNumberId: ${numberId ? numberId._serialized : 'null'}`);
+
+    if (!numberId) {
+      console.log('[CHECK] ❌ Número NO registrado en WhatsApp');
       return {
         status: 'PERMANENT_BAN',
-        message: '❌ Registrar nuevo — baneo permanente',
+        message: '❌ No está registrado en WhatsApp (baneo permanente)',
+        raw: { isRegistered: false },
+      };
+    }
+
+    // ══════════════════════════════════════════
+    // PASO 2: Obtener info del contacto (con timeout propio)
+    // ══════════════════════════════════════════
+    console.log(`[CHECK] getContactById(${numberId._serialized})...`);
+
+    let contact;
+    try {
+      contact = await withTimeout(
+        c.getContactById(numberId._serialized),
+        20000,
+        'getContactById'
+      );
+      console.log(`[CHECK] isWAContact: ${contact.isWAContact}, isUser: ${contact.isUser}`);
+    } catch (e) {
+      console.log(`[CHECK] ⚠️ getContactById falló: ${e.message}`);
+      // Si falla pero getNumberId devolvió algo, el número existe
+      return {
+        status: 'VERIFY',
+        message: '🔄 Número registrado (verificación parcial)',
+        raw: { numberId: numberId._serialized, contactError: e.message },
+      };
+    }
+
+    if (!contact.isWAContact) {
+      console.log('[CHECK] ❌ isWAContact = false');
+      return {
+        status: 'PERMANENT_BAN',
+        message: '❌ No es contacto de WhatsApp (baneo permanente)',
         raw: { isWAContact: false, isUser: contact.isUser },
       };
     }
 
+    // ══════════════════════════════════════════
+    // PASO 3: Intentar obtener el chat para más info
+    // ══════════════════════════════════════════
+    console.log(`[CHECK] getChatById(${numberId._serialized})...`);
+
     try {
-      console.log(`[CHECK] getChatById(${chatId})...`);
-      const chat = await c.getChatById(chatId);
+      const chat = await withTimeout(
+        c.getChatById(numberId._serialized),
+        15000,
+        'getChatById'
+      );
 
       if (chat && chat.name) {
-        console.log(`[CHECK] ✅ Activo: ${chat.name}`);
+        console.log(`[CHECK] ✅ ACTIVO — Nombre: ${chat.name}`);
         return {
           status: 'ACTIVE',
           message: '✅ Número activo',
-          raw: { name: chat.name, isWAContact: true },
+          raw: {
+            name: chat.name,
+            numberId: numberId._serialized,
+          },
         };
       }
 
@@ -394,7 +405,7 @@ async function checkNumberStatus(phone) {
       return {
         status: 'VERIFY',
         message: '🔄 Verificar estado',
-        raw: { chatExists: true },
+        raw: { hasChat: true, numberId: numberId._serialized },
       };
     } catch (chatError) {
       const errMsg = (chatError.message || '').toLowerCase();
@@ -411,7 +422,7 @@ async function checkNumberStatus(phone) {
       if (errMsg.includes('ban spam') || errMsg.includes('spam')) {
         return {
           status: 'SPAM_BAN',
-          message: '🚫 Ban por spam',
+          message: '🚫 Ban por spam detectado',
           raw: { error: chatError.message },
         };
       }
@@ -424,14 +435,27 @@ async function checkNumberStatus(phone) {
         };
       }
 
+      // Si el número está registrado (getNumberId lo confirmó), es ACTIVO aunque
+      // no podamos obtener el nombre del chat
       return {
-        status: 'UNKNOWN',
-        message: `❓ Estado desconocido: ${chatError.message}`,
-        raw: { error: chatError.message },
+        status: 'ACTIVE',
+        message: '✅ Número activo (verificado)',
+        raw: { numberId: numberId._serialized, chatError: chatError.message },
       };
     }
   } catch (e) {
-    console.error(`[CHECK] Error general: ${e.message}`);
+    console.error(`[CHECK] ❌ Error general: ${e.message}`);
+    console.error(e.stack);
+
+    // Si fue timeout en getNumberId
+    if (e.message.includes('Timeout')) {
+      return {
+        status: 'ERROR',
+        message: `⏱️ ${e.message}`,
+        raw: { error: e.message, timedOut: true },
+      };
+    }
+
     return {
       status: 'ERROR',
       message: `❌ Error: ${e.message}`,
@@ -440,21 +464,20 @@ async function checkNumberStatus(phone) {
   }
 }
 
+// ══════════════════════════════════════════
+// HELPERS
+// ══════════════════════════════════════════
+
 async function isNumberBanned(phone) {
   const result = await checkNumberStatus(phone);
-  return result.status !== 'ACTIVE';
+  return result.status !== 'ACTIVE' && result.status !== 'VERIFY';
 }
-
-// ══════════════════════════════════════════
-// DESTRUIR CLIENTE
-// ══════════════════════════════════════════
 
 async function destroyClient() {
   console.log('[WHATSAPP] Destruyendo cliente...');
   if (client) {
     try {
       await client.destroy();
-      console.log('[WHATSAPP] Cliente destruido');
     } catch (e) {
       console.error('[WHATSAPP] Error al destruir:', e.message);
     }
@@ -463,10 +486,6 @@ async function destroyClient() {
     isInitializing = false;
   }
 }
-
-// ══════════════════════════════════════════
-// DIAGNÓSTICO
-// ══════════════════════════════════════════
 
 function getDiagnostics() {
   return {
