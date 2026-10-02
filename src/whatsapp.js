@@ -1,15 +1,13 @@
 /**
- * MÓDULO DE WHATSAPP — VERSIÓN CORREGIDA
- * - Usa getNumberId() para verificar existencia (rápido)
- * - Timeout wrapper de 20s por operación (no cuelga 90s)
- * - Full debug
+ * MÓDULO DE WHATSAPP — VERSIÓN FINAL
+ * - NO emite eventos QR en cadena (evita spam)
+ * - checkNumberStatus() con isRegisteredUser + fallbacks
+ * - Timeouts de 15s por operación
  */
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
 const EventEmitter = require('events');
 const fs = require('fs');
-const path = require('path');
 const config = require('./config');
 const { dbg } = config;
 
@@ -22,14 +20,15 @@ const emitter = new EventEmitter();
 let client = null;
 let isReady = false;
 let readyResolvers = [];
-let qrDisplayed = false;
 let currentQR = null;
+let currentQRBuffer = null;
 let isInitializing = false;
 let lastEventName = 'none';
 let lastEventTime = null;
 let initStartTime = null;
 let initError = null;
 let initAttempts = 0;
+let fullySyncedAt = null; // Timestamp cuando el cliente terminó de sincronizar
 
 function setEvent(name) {
   lastEventName = name;
@@ -41,9 +40,6 @@ function setEvent(name) {
 // TIMEOUT WRAPPER
 // ══════════════════════════════════════════
 
-/**
- * Envuelve una promesa con timeout propio (evita cuelgues de 90s)
- */
 function withTimeout(promise, ms, label) {
   return Promise.race([
     promise,
@@ -68,27 +64,20 @@ function createClient() {
       '/usr/bin/chromium-browser',
       '/usr/bin/google-chrome',
       '/snap/bin/chromium',
-      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
     ];
 
     for (const p of possiblePaths) {
       try {
         if (fs.existsSync(p)) {
           chromePath = p;
-          console.log(`[WHATSAPP] ✅ Chrome encontrado: ${p}`);
+          console.log(`[WHATSAPP] ✅ Chrome: ${p}`);
           break;
         }
       } catch (e) {}
     }
-  } else {
-    console.log(`[WHATSAPP] chromePath desde config: ${chromePath}`);
   }
 
-  if (!chromePath) {
-    throw new Error('Chrome no encontrado');
-  }
-
-  console.log(`[WHATSAPP] Session path: ${config.whatsapp.sessionPath}`);
+  if (!chromePath) throw new Error('Chrome no encontrado');
 
   const newClient = new Client({
     authStrategy: new LocalAuth({
@@ -125,18 +114,30 @@ function createClient() {
   // EVENTOS
   // ══════════════════════════════════════════
 
-  newClient.on('qr', (qr) => {
+  newClient.on('qr', async (qr) => {
     setEvent('qr');
-    console.log(`\n[WHATSAPP] 📲 QR RECIBIDO (length: ${qr.length})`);
+    console.log(`\n[WHATSAPP] 📲 QR generado (length: ${qr.length})`);
+    console.log('[WHATSAPP] ⚠️ NO se envía automáticamente. Usa /session');
+
     currentQR = qr;
 
-    if (!qrDisplayed) {
-      try { qrcode.generate(qr, { small: true }); } catch (e) {}
-      qrDisplayed = true;
+    // Generar imagen y guardarla EN MEMORIA (no enviar)
+    try {
+      const QRCode = require('qrcode');
+      currentQRBuffer = await QRCode.toBuffer(qr, {
+        type: 'png',
+        width: 600,
+        margin: 2,
+        errorCorrectionLevel: 'M',
+      });
+      console.log(`[WHATSAPP] 💾 QR guardado en memoria (${(currentQRBuffer.length / 1024).toFixed(1)} KB)\n`);
+    } catch (e) {
+      console.error('[WHATSAPP] ❌ Error generando buffer QR:', e.message);
+      currentQRBuffer = null;
     }
 
-    emitter.emit('qr', qr);
-    console.log('[WHATSAPP] ✅ Evento "qr" emitido\n');
+    // NO emitir a index.js → evita spam
+    // emitter.emit('qr', qr);  // ← QUITADO INTENCIONALMENTE
   });
 
   newClient.on('loading_screen', (percent, message) => {
@@ -168,11 +169,17 @@ function createClient() {
     console.log('\n[WHATSAPP] ✅✅✅ CLIENTE LISTO ✅✅✅');
     isReady = true;
     isInitializing = false;
-    qrDisplayed = false;
 
     const info = newClient.info;
     console.log(`[WHATSAPP] Número: +${info?.wid?.user}`);
-    console.log(`[WHATSAPP] Nombre: ${info?.pushname}\n`);
+    console.log(`[WHATSAPP] Nombre: ${info?.pushname}`);
+
+    // Marcar sync time (esperar 20s antes de aceptar queries)
+    fullySyncedAt = null;
+    setTimeout(() => {
+      fullySyncedAt = Date.now();
+      console.log('[WHATSAPP] 🔄 Cliente completamente sincronizado\n');
+    }, 20000);
 
     emitter.emit('ready', info);
 
@@ -185,6 +192,7 @@ function createClient() {
     console.error(`\n[WHATSAPP] ❌ DESCONECTADO: ${reason}\n`);
     isReady = false;
     isInitializing = false;
+    fullySyncedAt = null;
     client = null;
     emitter.emit('disconnected', reason);
   });
@@ -230,7 +238,7 @@ async function initializeWhatsApp() {
 
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      console.error(`\n[WHATSAPP] ❌ TIMEOUT — Último evento: ${lastEventName}`);
+      console.error(`\n[WHATSAPP] ❌ TIMEOUT — Evento: ${lastEventName}`);
       isInitializing = false;
       reject(new Error(`Timeout. Evento: ${lastEventName}`));
     }, 5 * 60 * 1000);
@@ -268,8 +276,9 @@ async function restartForQR() {
     client = null;
     isReady = false;
     isInitializing = false;
-    qrDisplayed = false;
     currentQR = null;
+    currentQRBuffer = null;
+    fullySyncedAt = null;
     initError = null;
 
     const sessionDir = config.whatsapp.sessionPath;
@@ -305,8 +314,7 @@ async function getReadyClient() {
 }
 
 // ══════════════════════════════════════════
-// ⭐ VERIFICAR ESTADO DE UN NÚMERO (CORREGIDO)
-// Usa getNumberId() — rápido y confiable
+// VERIFICAR ESTADO (SIMPLIFICADO Y ROBUSTO)
 // ══════════════════════════════════════════
 
 async function checkNumberStatus(phone) {
@@ -322,144 +330,108 @@ async function checkNumberStatus(phone) {
     };
   }
 
+  const chatId = `${phone}@c.us`;
+
+  // ══════════════════════════════════════════
+  // PASO 1: ¿Está registrado en WhatsApp?
+  // Usamos isRegisteredUser (rápido) con fallback a getNumberId
+  // ══════════════════════════════════════════
+  let isRegistered = false;
+  let method = 'none';
+
+  // Intento 1: isRegisteredUser
   try {
-    // ══════════════════════════════════════════
-    // PASO 1: ¿El número está registrado en WhatsApp?
-    // getNumberId() es MUCHO más rápido que getContactById()
-    // ══════════════════════════════════════════
-    console.log(`[CHECK] getNumberId(${phone})...`);
-    const numberId = await withTimeout(
-      c.getNumberId(phone),
-      20000,
-      'getNumberId'
+    console.log(`[CHECK] isRegisteredUser(${chatId})...`);
+    isRegistered = await withTimeout(
+      c.isRegisteredUser(chatId),
+      15000,
+      'isRegisteredUser'
     );
-
-    console.log(`[CHECK] Resultado getNumberId: ${numberId ? numberId._serialized : 'null'}`);
-
-    if (!numberId) {
-      console.log('[CHECK] ❌ Número NO registrado en WhatsApp');
-      return {
-        status: 'PERMANENT_BAN',
-        message: '❌ No está registrado en WhatsApp (baneo permanente)',
-        raw: { isRegistered: false },
-      };
-    }
-
-    // ══════════════════════════════════════════
-    // PASO 2: Obtener info del contacto (con timeout propio)
-    // ══════════════════════════════════════════
-    console.log(`[CHECK] getContactById(${numberId._serialized})...`);
-
-    let contact;
-    try {
-      contact = await withTimeout(
-        c.getContactById(numberId._serialized),
-        20000,
-        'getContactById'
-      );
-      console.log(`[CHECK] isWAContact: ${contact.isWAContact}, isUser: ${contact.isUser}`);
-    } catch (e) {
-      console.log(`[CHECK] ⚠️ getContactById falló: ${e.message}`);
-      // Si falla pero getNumberId devolvió algo, el número existe
-      return {
-        status: 'VERIFY',
-        message: '🔄 Número registrado (verificación parcial)',
-        raw: { numberId: numberId._serialized, contactError: e.message },
-      };
-    }
-
-    if (!contact.isWAContact) {
-      console.log('[CHECK] ❌ isWAContact = false');
-      return {
-        status: 'PERMANENT_BAN',
-        message: '❌ No es contacto de WhatsApp (baneo permanente)',
-        raw: { isWAContact: false, isUser: contact.isUser },
-      };
-    }
-
-    // ══════════════════════════════════════════
-    // PASO 3: Intentar obtener el chat para más info
-    // ══════════════════════════════════════════
-    console.log(`[CHECK] getChatById(${numberId._serialized})...`);
-
-    try {
-      const chat = await withTimeout(
-        c.getChatById(numberId._serialized),
-        15000,
-        'getChatById'
-      );
-
-      if (chat && chat.name) {
-        console.log(`[CHECK] ✅ ACTIVO — Nombre: ${chat.name}`);
-        return {
-          status: 'ACTIVE',
-          message: '✅ Número activo',
-          raw: {
-            name: chat.name,
-            numberId: numberId._serialized,
-          },
-        };
-      }
-
-      console.log('[CHECK] ⚠️ Sin nombre, marcando VERIFY');
-      return {
-        status: 'VERIFY',
-        message: '🔄 Verificar estado',
-        raw: { hasChat: true, numberId: numberId._serialized },
-      };
-    } catch (chatError) {
-      const errMsg = (chatError.message || '').toLowerCase();
-      console.error(`[CHECK] Error getChatById: ${chatError.message}`);
-
-      if (errMsg.includes('request review') || errMsg.includes('review')) {
-        return {
-          status: 'TEMPORARY_BAN',
-          message: '⚠️ Solicitar revisión — baneo temporal',
-          raw: { error: chatError.message },
-        };
-      }
-
-      if (errMsg.includes('ban spam') || errMsg.includes('spam')) {
-        return {
-          status: 'SPAM_BAN',
-          message: '🚫 Ban por spam detectado',
-          raw: { error: chatError.message },
-        };
-      }
-
-      if (errMsg.includes('not registered') || errMsg.includes('invalid')) {
-        return {
-          status: 'PERMANENT_BAN',
-          message: '❌ Registrar nuevo — baneo permanente',
-          raw: { error: chatError.message },
-        };
-      }
-
-      // Si el número está registrado (getNumberId lo confirmó), es ACTIVO aunque
-      // no podamos obtener el nombre del chat
-      return {
-        status: 'ACTIVE',
-        message: '✅ Número activo (verificado)',
-        raw: { numberId: numberId._serialized, chatError: chatError.message },
-      };
-    }
+    method = 'isRegisteredUser';
+    console.log(`[CHECK] isRegisteredUser → ${isRegistered}`);
   } catch (e) {
-    console.error(`[CHECK] ❌ Error general: ${e.message}`);
-    console.error(e.stack);
+    console.log(`[CHECK] ⚠️ isRegisteredUser falló: ${e.message}`);
 
-    // Si fue timeout en getNumberId
-    if (e.message.includes('Timeout')) {
+    // Intento 2: getNumberId
+    try {
+      console.log(`[CHECK] getNumberId(${phone})...`);
+      const numberId = await withTimeout(
+        c.getNumberId(phone),
+        15000,
+        'getNumberId'
+      );
+      isRegistered = !!numberId;
+      method = 'getNumberId';
+      console.log(`[CHECK] getNumberId → ${isRegistered ? numberId._serialized : 'null'}`);
+    } catch (e2) {
+      console.log(`[CHECK] ⚠️ getNumberId también falló: ${e2.message}`);
+
+      // Ambos fallaron → probablemente timeout de WhatsApp
       return {
         status: 'ERROR',
-        message: `⏱️ ${e.message}`,
-        raw: { error: e.message, timedOut: true },
+        message: `⏱️ Timeout verificando. WhatsApp no responde.`,
+        raw: { isRegisteredError: e2.message, firstError: e.message },
+      };
+    }
+  }
+
+  // Si no está registrado → PERMANENT_BAN
+  if (!isRegistered) {
+    console.log(`[CHECK] ❌ No registrado (método: ${method})`);
+    return {
+      status: 'PERMANENT_BAN',
+      message: '❌ No está registrado en WhatsApp (baneo permanente o número inexistente)',
+      raw: { isRegistered: false, method },
+    };
+  }
+
+  // ══════════════════════════════════════════
+  // PASO 2: Está registrado → obtener contacto con timeout corto
+  // ══════════════════════════════════════════
+  try {
+    console.log(`[CHECK] getContactById(${chatId})...`);
+    const contact = await withTimeout(
+      c.getContactById(chatId),
+      15000,
+      'getContactById'
+    );
+
+    console.log(`[CHECK] isWAContact: ${contact.isWAContact}`);
+
+    if (!contact.isWAContact) {
+      return {
+        status: 'PERMANENT_BAN',
+        message: '❌ No es contacto de WhatsApp',
+        raw: { isWAContact: false },
       };
     }
 
+    // Éxito
+    const name = contact.name || contact.pushname || null;
+    console.log(`[CHECK] ✅ ACTIVO — ${name || 'sin nombre'}`);
+
     return {
-      status: 'ERROR',
-      message: `❌ Error: ${e.message}`,
-      raw: { error: e.message },
+      status: 'ACTIVE',
+      message: '✅ Número activo',
+      raw: {
+        name,
+        isWAContact: true,
+        method,
+      },
+    };
+  } catch (e) {
+    // Si el contacto falla PERO el número está registrado, asumimos ACTIVE
+    console.log(`[CHECK] ⚠️ getContactById falló: ${e.message}`);
+    console.log('[CHECK] Número registrado → marcando como ACTIVO');
+
+    return {
+      status: 'ACTIVE',
+      message: '✅ Número activo (verificado por registro)',
+      raw: {
+        method,
+        contactError: e.message,
+        note: 'isRegisteredUser confirmó que existe',
+      },
     };
   }
 }
@@ -484,6 +456,7 @@ async function destroyClient() {
     client = null;
     isReady = false;
     isInitializing = false;
+    fullySyncedAt = null;
   }
 }
 
@@ -491,7 +464,7 @@ function getDiagnostics() {
   return {
     ready: isReady,
     initializing: isInitializing,
-    hasQR: !!currentQR,
+    hasQR: !!currentQRBuffer,
     lastEvent: lastEventName,
     lastEventTime: lastEventTime?.toISOString() || null,
     initStartTime: initStartTime ? new Date(initStartTime).toISOString() : null,
@@ -499,7 +472,22 @@ function getDiagnostics() {
     initError,
     initAttempts,
     hasClient: !!client,
+    fullySynced: !!fullySyncedAt,
   };
+}
+
+function getQRBuffer() {
+  return currentQRBuffer;
+}
+
+function hasQR() {
+  return !!currentQRBuffer;
+}
+
+function clearQR() {
+  currentQR = null;
+  currentQRBuffer = null;
+  console.log('[WHATSAPP] QR limpiado');
 }
 
 // ══════════════════════════════════════════
@@ -517,6 +505,9 @@ module.exports = {
   getClient: () => client,
   isReady: () => isReady,
   getQR: () => currentQR,
+  getQRBuffer,
+  hasQR,
+  clearQR,
   getDiagnostics,
   emitter,
 };
