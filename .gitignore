@@ -1,0 +1,23 @@
+# Dependencias
+node_modules/
+
+# Variables de entorno
+.env
+.env.*
+
+# Sesión de WhatsApp (se sube como ZIP a logs/, no la carpeta entera)
+wa_session/
+tokens/
+
+# Logs locales
+*.log
+npm-debug.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
