@@ -1,145 +1,22 @@
 /**
- * MÓDULO DE WHATSAPP — ULTRA-DEBUG v3 (MÁXIMO REAL)
- * - Captura TODOS los eventos de Chrome y WhatsApp Web
- * - Detecta errores específicos de la librería
- * - Multiple métodos de store + fallback en cascada
- * - Full stats, memoria, CPU, uptime
- * - Manejo de p-timeout interno
+ * MÓDULO DE WHATSAPP — v4 FINAL
+ * - isRegisteredUser() como método PRINCIPAL (oficial)
+ * - protocolTimeout alto (10 min) para evitar CDP hangs
+ * - Health check antes de cada operación
+ * - Auto-restart si el page está colgado
+ * - Full debug con stack traces
  */
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const EventEmitter = require('events');
 const fs = require('fs');
-const path = require('path');
 const config = require('./config');
 const { dbg } = config;
 
 const emitter = new EventEmitter();
 
 // ══════════════════════════════════════════
-// STATS GLOBALES
-// ══════════════════════════════════════════
-
-const stats = {
-  totalChecks: 0,
-  successChecks: 0,
-  failedChecks: 0,
-  timeoutChecks: 0,
-  storeSuccess: 0,
-  storeFail: 0,
-  fallbackSuccess: 0,
-  fallbackFail: 0,
-  consecutiveFailures: 0,
-  maxConsecutiveFailures: 0,
-  avgStoreMs: 0,
-  avgFallbackMs: 0,
-  avgTotalMs: 0,
-  memoryPeakMB: 0,
-  chromeCrashes: 0,
-  pageErrors: 0,
-  consoleErrors: 0,
-  networkErrors: 0,
-  startTime: Date.now(),
-};
-
-const activeChecks = new Map();
-
-// ══════════════════════════════════════════
-// LOGGING CON FULL CONTEXTO
-// ══════════════════════════════════════════
-
-function getFullMem() {
-  const m = process.memoryUsage();
-  return {
-    heap: (m.heapUsed / 1024 / 1024).toFixed(1),
-    rss: (m.rss / 1024 / 1024).toFixed(1),
-    ext: (m.external / 1024 / 1024).toFixed(1),
-  };
-}
-
-function getUptime() {
-  const up = process.uptime();
-  const h = Math.floor(up / 3600);
-  const m = Math.floor((up % 3600) / 60);
-  const s = Math.floor(up % 60);
-  return `${h}h${m}m${s}s`;
-}
-
-function log(tag, msg, data) {
-  const ts = new Date().toISOString();
-  const mem = getFullMem();
-  const extra = data !== undefined ? ' | ' + JSON.stringify(data) : '';
-  console.log(`[${ts}] [${tag}] [heap:${mem.heap}MB rss:${mem.rss}MB up:${getUptime()}] ${msg}${extra}`);
-
-  const memNum = parseFloat(mem.heap);
-  if (memNum > stats.memoryPeakMB) stats.memoryPeakMB = memNum;
-}
-
-function logError(tag, msg, err) {
-  const ts = new Date().toISOString();
-  const mem = getFullMem();
-  console.error(`[${ts}] [${tag}] [heap:${mem.heap}MB rss:${mem.rss}MB up:${getUptime()}] ❌ ${msg}`);
-
-  if (err) {
-    if (err.name) console.error(`[${tag}]   name: ${err.name}`);
-    if (err.message) console.error(`[${tag}]   message: ${err.message}`);
-    if (err.code) console.error(`[${tag}]   code: ${err.code}`);
-    if (err.label) console.error(`[${tag}]   label: ${err.label}`);
-    if (err.isTimeout) console.error(`[${tag}]   isTimeout: true`);
-    if (err.elapsedMs) console.error(`[${tag}]   elapsedMs: ${err.elapsedMs}`);
-
-    // Stack COMPLETO (no truncar)
-    if (err.stack) {
-      const lines = err.stack.split('\n');
-      console.error(`[${tag}]   ─── STACK COMPLETO (${lines.length} líneas) ───`);
-      lines.forEach(l => console.error(`[${tag}]   ${l}`));
-      console.error(`[${tag}]   ─── FIN STACK ───`);
-    }
-
-    // Causa encadenada
-    if (err.cause) {
-      console.error(`[${tag}]   ─── CAUSA ───`);
-      console.error(`[${tag}]   ${err.cause.message}`);
-      if (err.cause.stack) {
-        err.cause.stack.split('\n').slice(0, 10).forEach(l =>
-          console.error(`[${tag}]   ${l}`)
-        );
-      }
-    }
-  }
-}
-
-// ══════════════════════════════════════════
-// DETECCIÓN DE ERRORES ESPECÍFICOS
-// ══════════════════════════════════════════
-
-function classifyError(err) {
-  if (!err) return 'UNKNOWN';
-
-  const msg = (err.message || '').toLowerCase();
-  const name = (err.name || '').toLowerCase();
-
-  if (err.isTimeout || msg.includes('timeout')) return 'TIMEOUT';
-  if (msg.includes('execution context was destroyed')) return 'CONTEXT_DESTROYED';
-  if (msg.includes('target closed')) return 'TARGET_CLOSED';
-  if (msg.includes('session closed')) return 'SESSION_CLOSED';
-  if (msg.includes('protocol error')) return 'PROTOCOL_ERROR';
-  if (msg.includes('navigator is not defined')) return 'NAVIGATOR_UNDEFINED';
-  if (msg.includes('evaluation failed')) return 'EVALUATION_FAILED';
-  if (msg.includes('window.store is undefined')) return 'STORE_UNDEFINED';
-  if (msg.includes('cannot read propert')) return 'NULL_PROPERTY';
-  if (msg.includes('not a function')) return 'NOT_A_FUNCTION';
-  if (msg.includes('invalid wid')) return 'INVALID_WID';
-  if (msg.includes('detached frame')) return 'DETACHED_FRAME';
-  if (msg.includes('navigation failed')) return 'NAVIGATION_FAILED';
-  if (msg.includes('page crashed')) return 'PAGE_CRASHED';
-  if (name.includes('timeouterror')) return 'TIMEOUT_LIB';
-
-  return 'UNKNOWN';
-}
-
-// ══════════════════════════════════════════
-// ESTADO
+// ESTADO GLOBAL
 // ══════════════════════════════════════════
 
 let client = null;
@@ -148,19 +25,72 @@ let readyResolvers = [];
 let currentQR = null;
 let currentQRBuffer = null;
 let isInitializing = false;
-let lastEventName = 'none';
-let lastEventTime = null;
 let initStartTime = null;
 let initError = null;
 let initAttempts = 0;
-let destroyCount = 0;
-let reconnectCount = 0;
-let pageListenersAttached = false;
 
-function setEvent(name) {
-  lastEventName = name;
-  lastEventTime = new Date();
-  log('WHATSAPP-EVENT', `→ ${name}`);
+// Mutex para serializar checks
+let checkLock = Promise.resolve();
+
+// ══════════════════════════════════════════
+// STATS
+// ══════════════════════════════════════════
+
+const stats = {
+  totalChecks: 0,
+  successChecks: 0,
+  failedChecks: 0,
+  timeoutChecks: 0,
+  restarts: 0,
+  pageHealthchecksOK: 0,
+  pageHealthchecksFail: 0,
+  avgCheckMs: 0,
+  lastCheckMs: 0,
+  peakHeapMB: 0,
+  startTime: Date.now(),
+};
+
+// ══════════════════════════════════════════
+// LOGGING
+// ══════════════════════════════════════════
+
+function memInfo() {
+  const m = process.memoryUsage();
+  return {
+    heap: (m.heapUsed / 1024 / 1024).toFixed(1),
+    rss: (m.rss / 1024 / 1024).toFixed(1),
+  };
+}
+
+function uptime() {
+  const s = Math.floor(process.uptime());
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return `${h}h${m}m${sec}s`;
+}
+
+function log(tag, msg, data) {
+  const m = memInfo();
+  const extra = data !== undefined ? ' | ' + JSON.stringify(data) : '';
+  console.log(`[${new Date().toISOString()}] [${tag}] [heap:${m.heap}MB rss:${m.rss}MB up:${uptime()}] ${msg}${extra}`);
+  const heapNum = parseFloat(m.heap);
+  if (heapNum > stats.peakHeapMB) stats.peakHeapMB = heapNum;
+}
+
+function logError(tag, msg, err) {
+  const m = memInfo();
+  console.error(`[${new Date().toISOString()}] [${tag}] [heap:${m.heap}MB rss:${m.rss}MB] ❌ ${msg}`);
+  if (err) {
+    if (err.name) console.error(`[${tag}]   name: ${err.name}`);
+    if (err.message) console.error(`[${tag}]   message: ${err.message}`);
+    if (err.label) console.error(`[${tag}]   label: ${err.label}`);
+    if (err.elapsedMs) console.error(`[${tag}]   elapsedMs: ${err.elapsedMs}`);
+    if (err.stack) {
+      const lines = err.stack.split('\n').slice(0, 6);
+      lines.forEach(l => console.error(`[${tag}]   ${l.trim()}`));
+    }
+  }
 }
 
 // ══════════════════════════════════════════
@@ -168,117 +98,72 @@ function setEvent(name) {
 // ══════════════════════════════════════════
 
 function withTimeout(promise, ms, label) {
-  log('TIMEOUT', `Iniciando "${label}" (${ms}ms)`);
-
   return new Promise((resolve, reject) => {
     let settled = false;
-    const startTime = Date.now();
-
+    const start = Date.now();
     const timeoutId = setTimeout(() => {
       if (settled) return;
       settled = true;
-      const elapsed = Date.now() - startTime;
-      const err = new Error(`TIMEOUT_${label}_${ms}ms`);
+      const err = new Error(`TIMEOUT_${label}`);
       err.isTimeout = true;
       err.label = label;
-      err.elapsedMs = elapsed;
-      logError('TIMEOUT', `"${label}" TIMEOUT tras ${elapsed}ms`, err);
+      err.elapsedMs = Date.now() - start;
+      logError('TIMEOUT', `"${label}" TIMEOUT en ${err.elapsedMs}ms`, err);
       reject(err);
     }, ms);
 
     promise.then(
-      (val) => {
-        if (settled) {
-          log('TIMEOUT', `⚠️ "${label}" resolvió tarde (ignorado)`);
-          return;
-        }
+      (v) => {
+        if (settled) return;
         settled = true;
         clearTimeout(timeoutId);
-        log('TIMEOUT', `✅ "${label}" OK en ${Date.now() - startTime}ms`);
-        resolve(val);
+        resolve(v);
       },
-      (err) => {
-        if (settled) {
-          log('TIMEOUT', `⚠️ "${label}" rechazó tarde (ignorado): ${err.message}`);
-          return;
-        }
+      (e) => {
+        if (settled) return;
         settled = true;
         clearTimeout(timeoutId);
-        logError('TIMEOUT', `"${label}" falló en ${Date.now() - startTime}ms`, err);
-        reject(err);
+        reject(e);
       }
     ).catch((e) => {
-      logError('TIMEOUT', `Error tardío en "${label}"`, e);
+      // Silenciar errores tardíos
+      log('TIMEOUT', `Error tardío en "${label}" ignorado: ${e.message}`);
     });
   });
 }
 
 // ══════════════════════════════════════════
-// ADJUNTAR LISTENERS A LA PÁGINA CHROME
+// HEALTH CHECK DE LA PÁGINA
 // ══════════════════════════════════════════
 
-function attachPageListeners(c) {
-  if (!c.pupPage || pageListenersAttached) {
-    log('PAGE', `No se adjuntan listeners (pupPage: ${!!c.pupPage}, ya adjuntados: ${pageListenersAttached})`);
-    return;
+async function healthCheckPage() {
+  if (!client || !client.pupPage) {
+    log('HEALTH', 'No hay pupPage');
+    return false;
   }
 
-  log('PAGE', '═══════ ADJUNTANDO LISTENERS A LA PÁGINA ═══════');
-
   try {
-    // ── Console de la página ──
-    c.pupPage.on('console', (msg) => {
-      const type = msg.type();
-      const text = msg.text();
+    const start = Date.now();
+    const result = await withTimeout(
+      client.pupPage.evaluate(() => 2 + 2),
+      5000,
+      'healthcheck'
+    );
+    const elapsed = Date.now() - start;
 
-      if (type === 'error') {
-        stats.consoleErrors++;
-        log('PAGE-CONSOLE-ERROR', text);
-      } else if (type === 'warning') {
-        log('PAGE-CONSOLE-WARN', text);
-      } else {
-        log('PAGE-CONSOLE', `[${type}] ${text}`);
-      }
-    });
+    if (result === 4) {
+      stats.pageHealthchecksOK++;
+      log('HEALTH', `✅ Página responde en ${elapsed}ms`);
+      return true;
+    }
 
-    // ── Excepciones JS de la página ──
-    c.pupPage.on('pageerror', (err) => {
-      stats.pageErrors++;
-      logError('PAGE-ERROR', 'Excepción JS en la página:', err);
-    });
-
-    // ── Respuestas HTTP fallidas ──
-    c.pupPage.on('response', (response) => {
-      const status = response.status();
-      if (status >= 400) {
-        stats.networkErrors++;
-        log('PAGE-NET', `HTTP ${status} → ${response.url().substring(0, 100)}`);
-      }
-    });
-
-    // ── Request failures ──
-    c.pupPage.on('requestfailed', (request) => {
-      stats.networkErrors++;
-      const failure = request.failure();
-      log('PAGE-NET-FAIL', `Falló: ${request.url().substring(0, 100)} → ${failure?.errorText}`);
-    });
-
-    // ── Frame detach ──
-    c.pupPage.on('framedetached', (frame) => {
-      log('PAGE-FRAME', `Frame detached: ${frame.url()?.substring(0, 80)}`);
-    });
-
-    // ── Frame navigation ──
-    c.pupPage.on('framenavigated', (frame) => {
-      if (frame === c.pupPage.mainFrame()) {
-        log('PAGE-NAV', `Frame principal navegó: ${frame.url()?.substring(0, 80)}`);
-      }
-    });
-
-    pageListenersAttached = true;
-    log('PAGE', '✅ Listeners adjuntados');
+    stats.pageHealthchecksFail++;
+    logError('HEALTH', `Página devolvió ${result} (esperado 4)`);
+    return false;
   } catch (e) {
-    logError('PAGE', 'Error adjuntando listeners', e);
+    stats.pageHealthchecksFail++;
+    logError('HEALTH', `❌ Página NO responde: ${e.message}`);
+    return false;
   }
 }
 
@@ -288,22 +173,18 @@ function attachPageListeners(c) {
 
 function createClient() {
   log('WHATSAPP', '═══════ CREANDO CLIENTE ═══════');
-  log('WHATSAPP', `Stats: checks=${stats.totalChecks}, ok=${stats.successChecks}, fail=${stats.failedChecks}`);
-  log('WHATSAPP', `Reconexiones: ${reconnectCount}, destroys: ${destroyCount}`);
 
   let chromePath = config.whatsapp.chromePath;
 
   if (!chromePath) {
-    const possiblePaths = [
+    const paths = [
       '/usr/bin/chromium',
       '/usr/bin/chromium-browser',
       '/usr/bin/google-chrome',
       '/snap/bin/chromium',
     ];
-    for (const p of possiblePaths) {
-      try {
-        if (fs.existsSync(p)) { chromePath = p; break; }
-      } catch (e) {}
+    for (const p of paths) {
+      try { if (fs.existsSync(p)) { chromePath = p; break; } } catch (e) {}
     }
   }
 
@@ -318,6 +199,8 @@ function createClient() {
     puppeteer: {
       executablePath: chromePath,
       headless: true,
+      // ⭐ CRÍTICO: Aumentar protocolTimeout para evitar "Runtime.callFunctionOn timed out"
+      protocolTimeout: 600000, // 10 minutos
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -335,26 +218,27 @@ function createClient() {
         '--no-default-browser-check',
         '--password-store=basic',
         '--use-mock-keychain',
+        // Reducir memoria de Chrome
+        '--single-process',
+        '--disable-features=site-per-process,IsolateOrigins',
       ],
     },
   });
 
   log('WHATSAPP', '✅ Cliente creado, registrando eventos...');
-  pageListenersAttached = false;
 
   // ══════════════════════════════════════════
   // EVENTOS
   // ══════════════════════════════════════════
 
   newClient.on('qr', async (qr) => {
-    setEvent('qr');
     log('WHATSAPP', `📲 QR (length: ${qr.length})`);
     currentQR = qr;
-
     try {
       const QRCode = require('qrcode');
       currentQRBuffer = await QRCode.toBuffer(qr, {
-        type: 'png', width: 600, margin: 2, errorCorrectionLevel: 'M',
+        type: 'png', width: 600, margin: 2,
+        errorCorrectionLevel: 'M',
       });
       log('WHATSAPP', `💾 QR buffer: ${(currentQRBuffer.length / 1024).toFixed(1)}KB`);
     } catch (e) {
@@ -364,25 +248,19 @@ function createClient() {
   });
 
   newClient.on('loading_screen', (percent, message) => {
-    setEvent(`loading_screen:${percent}`);
     log('WHATSAPP', `⏳ ${percent}% — ${message}`);
   });
 
   newClient.on('change_state', (state) => {
-    setEvent(`change_state:${state}`);
     log('WHATSAPP', `🔄 Estado: ${state}`);
   });
 
   newClient.on('authenticated', () => {
-    setEvent('authenticated');
     log('WHATSAPP', '✅ AUTENTICADO');
-    // Adjuntar listeners de página justo ahora
-    try { attachPageListeners(newClient); } catch (e) {}
     emitter.emit('authenticated');
   });
 
   newClient.on('auth_failure', (msg) => {
-    setEvent('auth_failure');
     logError('WHATSAPP', `FALLO AUTH: ${msg}`);
     isReady = false;
     initError = `Auth failure: ${msg}`;
@@ -390,7 +268,6 @@ function createClient() {
   });
 
   newClient.on('ready', () => {
-    setEvent('ready');
     log('WHATSAPP', '═══════ ✅ CLIENTE LISTO ═══════');
     isReady = true;
     isInitializing = false;
@@ -398,31 +275,23 @@ function createClient() {
     const info = newClient.info;
     log('WHATSAPP', `Número: +${info?.wid?.user}`);
     log('WHATSAPP', `Nombre: ${info?.pushname}`);
-    log('WHATSAPP', `Platform: ${info?.platform}`);
     log('WHATSAPP', `Init total: ${((Date.now() - initStartTime) / 1000).toFixed(1)}s`);
 
-    // Adjuntar listeners de página si no se hizo
-    try { attachPageListeners(newClient); } catch (e) {}
-
     emitter.emit('ready', info);
-    readyResolvers.forEach(resolve => resolve(newClient));
+    readyResolvers.forEach(r => r(newClient));
     readyResolvers = [];
   });
 
   newClient.on('disconnected', (reason) => {
-    setEvent('disconnected');
     logError('WHATSAPP', `DESCONECTADO: ${reason}`);
     isReady = false;
     isInitializing = false;
     client = null;
-    pageListenersAttached = false;
     emitter.emit('disconnected', reason);
   });
 
   newClient.on('error', (err) => {
-    setEvent('error');
-    const kind = classifyError(err);
-    logError('WHATSAPP', `EVENTO ERROR [${kind}]: ${err.message}`, err);
+    logError('WHATSAPP', `EVENTO ERROR: ${err.message}`, err);
     initError = err.message;
   });
 
@@ -459,9 +328,9 @@ async function initializeWhatsApp() {
 
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      logError('WHATSAPP', `TIMEOUT 5min. Último evento: ${lastEventName}`);
+      logError('WHATSAPP', `TIMEOUT init 5min. Último evento: N/A`);
       isInitializing = false;
-      reject(new Error(`Timeout. Evento: ${lastEventName}`));
+      reject(new Error('Timeout init'));
     }, 5 * 60 * 1000);
 
     readyResolvers.push(() => {
@@ -473,7 +342,7 @@ async function initializeWhatsApp() {
     client.initialize()
       .then(() => log('WHATSAPP', 'client.initialize() OK'))
       .catch((e) => {
-        logError('WHATSAPP', 'client.initialize() falló', e);
+        logError('WHATSAPP', 'initialize() falló', e);
         clearTimeout(timeout);
         isInitializing = false;
         initError = e.message;
@@ -482,18 +351,17 @@ async function initializeWhatsApp() {
   });
 }
 
+// ══════════════════════════════════════════
+// RESTART
+// ══════════════════════════════════════════
+
 async function restartForQR() {
   log('WHATSAPP', '═══════ RESTART PARA QR ═══════');
-  reconnectCount++;
+  stats.restarts++;
 
   try {
     if (client) {
-      try {
-        await client.destroy();
-        destroyCount++;
-      } catch (e) {
-        logError('WHATSAPP', 'Error destroy', e);
-      }
+      try { await client.destroy(); } catch (e) {}
     }
 
     client = null;
@@ -502,7 +370,6 @@ async function restartForQR() {
     currentQR = null;
     currentQRBuffer = null;
     initError = null;
-    pageListenersAttached = false;
 
     const sessionDir = config.whatsapp.sessionPath;
     if (fs.existsSync(sessionDir)) {
@@ -528,351 +395,177 @@ async function getReadyClient() {
 }
 
 // ══════════════════════════════════════════
-// VERIFICACIÓN VÍA STORE — MÚLTIPLES MÉTODOS
+// VERIFICAR ESTADO DE UN NÚMERO
+// Solo usa isRegisteredUser() — método oficial
 // ══════════════════════════════════════════
 
-async function checkViaStore(c, phone) {
-  log('STORE', '═══════ Consulta store ═══════');
-  log('STORE', `Número: ${phone}`);
-
-  if (!c.pupPage) {
-    logError('STORE', 'c.pupPage NO disponible');
-    return { ok: false, reason: 'no_pup_page' };
-  }
-
-  // Verificar si la página está cerrada
-  try {
-    if (typeof c.pupPage.isClosed === 'function' && c.pupPage.isClosed()) {
-      logError('STORE', 'pupPage ESTÁ CERRADA');
-      return { ok: false, reason: 'page_closed' };
-    }
-  } catch (e) {}
-
-  const widStr = `${phone}@c.us`;
-  const startTime = Date.now();
-
-  try {
-    // Verificar estado del store primero (rápido)
-    const storeOk = await withTimeout(
-      c.pupPage.evaluate(() => {
-        return {
-          hasStore: typeof window.Store !== 'undefined',
-          hasWidFactory: window.Store?.WidFactory !== undefined,
-          hasContact: window.Store?.Contact !== undefined,
-          hasGadd: typeof window.Store?.Contact?.gadd === 'function',
-          hasGet: typeof window.Store?.Contact?.get === 'function',
-          hasGetModelsArray: typeof window.Store?.Contact?.getModelsArray === 'function',
-          waVersion: window.Debug?.VERSION?.toString() || 'unknown',
-        };
-      }),
-      5000,
-      'store_check'
-    );
-
-    log('STORE', `Estado del store:`, storeOk);
-
-    if (!storeOk.hasStore) {
-      logError('STORE', 'window.Store NO existe');
-      return { ok: false, reason: 'no_store' };
-    }
-
-    // Intentar método 1: gadd
-    if (storeOk.hasGadd) {
-      log('STORE', 'Probando método 1: Contact.gadd()');
-      try {
-        const result = await withTimeout(
-          c.pupPage.evaluate(async (widStr) => {
-            try {
-              const wid = window.Store.WidFactory.createWid(widStr);
-              const arr = await window.Store.Contact.gadd(wid);
-              const contact = arr && arr[0];
-
-              if (!contact) return { exists: false, reason: 'no_contact_gadd' };
-
-              return {
-                exists: true,
-                isWAContact: !!contact.isWAContact,
-                isUser: !!contact.isUser,
-                isBusiness: !!contact.isBusiness,
-                isBlocked: !!contact.isBlocked,
-                name: contact.name || null,
-                pushname: contact.pushname || null,
-                number: contact.id?._serialized || null,
-                method: 'gadd',
-              };
-            } catch (e) {
-              return { exists: false, reason: 'eval_error_gadd', error: e.message };
-            }
-          }, widStr),
-          10000,
-          'store_gadd'
-        );
-
-        const elapsed = Date.now() - startTime;
-        log('STORE', `gadd → ${elapsed}ms`, result);
-
-        if (result.exists) return { ok: true, data: result };
-
-        log('STORE', `gadd no encontró: ${result.reason}`);
-      } catch (e) {
-        logError('STORE', 'gadd falló', e);
-      }
-    }
-
-    // Método 2: get (por WID)
-    if (storeOk.hasGet) {
-      log('STORE', 'Probando método 2: Contact.get()');
-      try {
-        const result = await withTimeout(
-          c.pupPage.evaluate(async (widStr) => {
-            try {
-              const wid = window.Store.WidFactory.createWid(widStr);
-              let contact = window.Store.Contact.get(wid);
-
-              if (!contact) {
-                // get() puede devolver undefined si no está en store
-                // Probar con getModelsArray
-                const all = window.Store.Contact.getModelsArray();
-                contact = all.find(c => c.id?._serialized === widStr);
-              }
-
-              if (!contact) return { exists: false, reason: 'no_contact_get' };
-
-              return {
-                exists: true,
-                isWAContact: !!contact.isWAContact,
-                isUser: !!contact.isUser,
-                isBusiness: !!contact.isBusiness,
-                isBlocked: !!contact.isBlocked,
-                name: contact.name || null,
-                pushname: contact.pushname || null,
-                number: contact.id?._serialized || null,
-                method: 'get',
-              };
-            } catch (e) {
-              return { exists: false, reason: 'eval_error_get', error: e.message };
-            }
-          }, widStr),
-          10000,
-          'store_get'
-        );
-
-        const elapsed = Date.now() - startTime;
-        log('STORE', `get → ${elapsed}ms`, result);
-
-        if (result.exists) return { ok: true, data: result };
-
-        log('STORE', `get no encontró: ${result.reason}`);
-      } catch (e) {
-        logError('STORE', 'get falló', e);
-      }
-    }
-
-    // Nada funcionó
-    return { ok: false, reason: 'all_methods_failed' };
-  } catch (e) {
-    logError('STORE', 'Error general', e);
-    return { ok: false, reason: classifyError(e), error: e.message };
-  }
-}
-
-// ══════════════════════════════════════════
-// FALLBACK: getNumberId
-// ══════════════════════════════════════════
-
-async function checkViaGetNumberId(c, phone) {
-  log('FALLBACK', '═══════ getNumberId ═══════');
-
-  const startTime = Date.now();
-
-  try {
-    const numberId = await withTimeout(
-      c.getNumberId(phone),
-      25000,
-      'getNumberId'
-    );
-    const elapsed = Date.now() - startTime;
-
-    log('FALLBACK', `→ ${numberId ? numberId._serialized : 'null'} en ${elapsed}ms`);
-
-    if (!numberId) return { ok: true, exists: false };
-
-    return {
-      ok: true,
-      exists: true,
-      data: {
-        exists: true,
-        isWAContact: true,
-        number: numberId._serialized,
-        name: null,
-        pushname: null,
-        method: 'getNumberId',
-      },
-    };
-  } catch (e) {
-    const elapsed = Date.now() - startTime;
-    const kind = classifyError(e);
-    logError('FALLBACK', `Error [${kind}] tras ${elapsed}ms`, e);
-    return { ok: false, reason: kind, error: e.message };
-  }
-}
-
-// ══════════════════════════════════════════
-// CHECK NUMBER STATUS
-// ══════════════════════════════════════════
 async function checkNumberStatus(phone) {
-  const totalStart = Date.now();
+  // Serializar checks: solo uno a la vez
+  const release = await acquireLock();
+
+  const start = Date.now();
+  stats.totalChecks++;
 
   log('CHECK', '════════════════════════════════════════');
   log('CHECK', `VERIFICANDO: ${phone}`);
-  log('CHECK', `ready=${isReady}, initializing=${isInitializing}, hasQR=${!!currentQRBuffer}`);
+  log('CHECK', `Check #${stats.totalChecks} | ready=${isReady}`);
   log('CHECK', '════════════════════════════════════════');
 
-  // ══════════════════════════════════════════
-  // PASO 0: VERIFICAR ESTADO ANTES DE NADA
-  // ══════════════════════════════════════════
-  if (!isReady) {
-    const elapsed = Date.now() - totalStart;
-    logError('CHECK', `WhatsApp no listo (ready=${isReady}). Abortando.`);
+  try {
+    // ══════════════════════════════════════════
+    // PASO 0: ¿Está conectado?
+    // ══════════════════════════════════════════
+    if (!isReady || !client) {
+      const msg = currentQRBuffer
+        ? '🔌 WhatsApp no conectado. Hay un QR pendiente — usa /session'
+        : '🔌 WhatsApp no conectado. Usa /session para conectar.';
 
-    let message = '❌ <b>WhatsApp no está conectado</b>\n\n';
-
-    if (currentQRBuffer) {
-      message += '📲 Hay un QR pendiente.\n\n' +
-                 '💡 Usa <code>/session</code> para recibirlo y escanearlo.';
-    } else if (isInitializing) {
-      message += '⏳ WhatsApp se está inicializando.\n\n' +
-                 '💡 Espera 1-2 minutos y usa <code>/session</code> para ver el QR.';
-    } else if (!client) {
-      message += '💡 Usa <code>/session</code> para generar un QR y conectar WhatsApp.';
-    } else {
-      message += '💡 Usa <code>/session</code> para ver el estado.';
+      return {
+        status: 'NOT_CONNECTED',
+        message: msg,
+        raw: { ready: isReady, hasQR: !!currentQRBuffer },
+      };
     }
 
+    const c = client;
+    const chatId = `${phone}@c.us`;
+    const numberOnly = phone;
+
+    // ══════════════════════════════════════════
+    // PASO 1: Health check de la página
+    // ══════════════════════════════════════════
+    log('CHECK', '[PASO 1/3] Health check de la página...');
+    const healthy = await healthCheckPage();
+
+    if (!healthy) {
+      logError('CHECK', 'Página no responde. Necesita restart.');
+
+      // Programar restart (sin bloquear la respuesta al usuario)
+      setImmediate(async () => {
+        log('CHECK', 'Programando restart por página no responde...');
+        try {
+          await restartForQR();
+        } catch (e) {
+          logError('CHECK', 'Error en restart automático', e);
+        }
+      });
+
+      return {
+        status: 'ERROR',
+        message: '⚠️ WhatsApp no responde. Reiniciando...\n\nIntenta de nuevo en 1-2 minutos.',
+        raw: { reason: 'page_unresponsive' },
+      };
+    }
+
+    log('CHECK', '[PASO 1/3] ✅ Página OK');
+
+    // ══════════════════════════════════════════
+    // PASO 2: isRegisteredUser (método OFICIAL)
+    // ══════════════════════════════════════════
+    log('CHECK', `[PASO 2/3] isRegisteredUser(${numberOnly})...`);
+
+    let isRegistered = null;
+    let checkMethod = 'isRegisteredUser';
+
+    try {
+      const t0 = Date.now();
+      isRegistered = await withTimeout(
+        c.isRegisteredUser(chatId),
+        30000,
+        'isRegisteredUser'
+      );
+      const elapsed = Date.now() - t0;
+      log('CHECK', `✅ isRegisteredUser → ${isRegistered} (${elapsed}ms)`);
+    } catch (e) {
+      logError('CHECK', `isRegisteredUser falló`, e);
+
+      // Fallback: getNumberId
+      log('CHECK', `Fallback: getNumberId(${numberOnly})...`);
+      checkMethod = 'getNumberId';
+
+      try {
+        const t0 = Date.now();
+        const numberId = await withTimeout(
+          c.getNumberId(numberOnly),
+          30000,
+          'getNumberId'
+        );
+        const elapsed = Date.now() - t0;
+
+        isRegistered = !!numberId;
+        log('CHECK', `✅ getNumberId → ${isRegistered ? numberId._serialized : 'null'} (${elapsed}ms)`);
+      } catch (e2) {
+        logError('CHECK', `getNumberId también falló`, e2);
+
+        const totalElapsed = Date.now() - start;
+
+        // Programar restart si ambos fallan
+        setImmediate(async () => {
+          log('CHECK', 'Ambos métodos fallaron. Programando restart...');
+          try { await restartForQR(); } catch (e) {}
+        });
+
+        return {
+          status: 'ERROR',
+          message: `⏱️ WhatsApp no responde (${(totalElapsed / 1000).toFixed(1)}s). Reiniciando...\n\nIntenta en 1-2 minutos.`,
+          raw: { error1: e.message, error2: e2.message, elapsedMs: totalElapsed },
+        };
+      }
+    }
+
+    // ══════════════════════════════════════════
+    // PASO 3: Interpretar
+    // ══════════════════════════════════════════
+    const totalElapsed = Date.now() - start;
+    stats.lastCheckMs = totalElapsed;
+    stats.avgCheckMs = stats.avgCheckMs === 0
+      ? totalElapsed
+      : (stats.avgCheckMs + totalElapsed) / 2;
+
+    if (isRegistered === false) {
+      log('CHECK', `❌ NO registrado → PERMANENT_BAN (${totalElapsed}ms)`);
+      stats.failedChecks++;
+
+      return {
+        status: 'PERMANENT_BAN',
+        message: '❌ No está registrado en WhatsApp',
+        raw: { isRegistered: false, method: checkMethod, elapsedMs: totalElapsed },
+      };
+    }
+
+    log('CHECK', `✅ ACTIVO (${totalElapsed}ms) — método: ${checkMethod}`);
+    stats.successChecks++;
+
     return {
-      status: 'NOT_CONNECTED',
-      message: message.replace(/<[^>]+>/g, ''), // sin HTML por si acaso
-      raw: {
-        ready: isReady,
-        initializing: isInitializing,
-        hasQR: !!currentQRBuffer,
-        hasClient: !!client,
-        elapsedMs: elapsed,
-      },
+      status: 'ACTIVE',
+      message: '✅ Número activo',
+      raw: { isRegistered: true, method: checkMethod, elapsedMs: totalElapsed },
     };
-  }
+  } catch (e) {
+    logError('CHECK', 'Error general', e);
+    stats.failedChecks++;
 
-  // ══════════════════════════════════════════
-  // PASO 1: OBTENER CLIENTE (ya listo)
-  // ══════════════════════════════════════════
-  log('CHECK', '[PASO 1/3] Obteniendo cliente...');
-  const c = client;
-
-  if (!c) {
-    logError('CHECK', 'Cliente null pese a isReady=true');
+    const elapsed = Date.now() - start;
     return {
       status: 'ERROR',
-      message: '❌ Cliente no disponible',
-      raw: { error: 'client_null_but_ready' },
+      message: `❌ Error: ${e.message}`,
+      raw: { error: e.message, elapsedMs: elapsed },
     };
+  } finally {
+    release();
   }
+}
 
-  log('CHECK', `✅ Cliente OK (${Date.now() - totalStart}ms)`);
+// ══════════════════════════════════════════
+// MUTEX SIMPLE
+// ══════════════════════════════════════════
 
-  // ══════════════════════════════════════════
-  // PASO 2: STORE
-  // ══════════════════════════════════════════
-  log('CHECK', '[PASO 2/3] Verificando vía store...');
-  const storeResult = await checkViaStore(c, phone);
-
-  if (storeResult.ok) {
-    stats.storeSuccess++;
-    stats.consecutiveFailures = 0;
-    const data = storeResult.data;
-    const elapsed = Date.now() - totalStart;
-
-    log('CHECK', `✅ Store OK (${elapsed}ms) — método: ${data.method}`);
-    log('CHECK', `isWAContact: ${data.isWAContact}, name: ${data.name || data.pushname}`);
-
-    stats.successChecks++;
-    stats.avgTotalMs = stats.avgTotalMs === 0 ? elapsed : (stats.avgTotalMs + elapsed) / 2;
-
-    if (!data.isWAContact) {
-      return {
-        status: 'PERMANENT_BAN',
-        message: '❌ No está registrado en WhatsApp',
-        raw: { ...data, elapsedMs: elapsed },
-      };
-    }
-
-    if (data.isBlocked) {
-      return {
-        status: 'ACTIVE',
-        message: '✅ Número activo (bloqueado por ti)',
-        raw: { ...data, elapsedMs: elapsed },
-      };
-    }
-
-    return {
-      status: 'ACTIVE',
-      message: '✅ Número activo',
-      raw: { ...data, elapsedMs: elapsed },
-    };
-  }
-
-  // ══════════════════════════════════════════
-  // PASO 3: FALLBACK
-  // ══════════════════════════════════════════
-  stats.storeFail++;
-  log('CHECK', `⚠️ Store falló (${storeResult.reason}). Fallback...`);
-  log('CHECK', '[PASO 3/3] getNumberId...');
-
-  const fallbackResult = await checkViaGetNumberId(c, phone);
-
-  if (fallbackResult.ok) {
-    const elapsed = Date.now() - totalStart;
-    stats.fallbackSuccess++;
-
-    if (!fallbackResult.exists) {
-      stats.successChecks++;
-      stats.consecutiveFailures = 0;
-      return {
-        status: 'PERMANENT_BAN',
-        message: '❌ No está registrado en WhatsApp',
-        raw: { isWAContact: false, elapsedMs: elapsed },
-      };
-    }
-
-    stats.successChecks++;
-    stats.consecutiveFailures = 0;
-    return {
-      status: 'ACTIVE',
-      message: '✅ Número activo',
-      raw: { ...fallbackResult.data, elapsedMs: elapsed },
-    };
-  }
-
-  // ══════════════════════════════════════════
-  // TODO FALLÓ
-  // ══════════════════════════════════════════
-  stats.fallbackFail++;
-  stats.failedChecks++;
-  stats.consecutiveFailures++;
-
-  const elapsed = Date.now() - totalStart;
-  logError('CHECK', `❌ Todo falló (${elapsed}ms)`);
-  logError('CHECK', `  store: ${storeResult.reason}`);
-  logError('CHECK', `  fallback: ${fallbackResult.reason}`);
-
-  return {
-    status: 'ERROR',
-    message: `⏱️ WhatsApp no responde (${(elapsed / 1000).toFixed(1)}s)`,
-    raw: {
-      storeError: storeResult.error || storeResult.reason,
-      fallbackError: fallbackResult.error || fallbackResult.reason,
-      elapsedMs: elapsed,
-    },
-  };
+function acquireLock() {
+  let release;
+  const next = new Promise((resolve) => { release = resolve; });
+  const current = checkLock;
+  checkLock = checkLock.then(() => next);
+  return current.then(() => release);
 }
 
 // ══════════════════════════════════════════
@@ -881,17 +574,15 @@ async function checkNumberStatus(phone) {
 
 async function isNumberBanned(phone) {
   const result = await checkNumberStatus(phone);
-  return result.status !== 'ACTIVE' && result.status !== 'VERIFY';
+  return result.status === 'PERMANENT_BAN';
 }
 
 async function destroyClient() {
-  log('WHATSAPP', 'Destruyendo cliente...');
   if (client) {
-    try { await client.destroy(); destroyCount++; } catch (e) {}
+    try { await client.destroy(); } catch (e) {}
     client = null;
     isReady = false;
     isInitializing = false;
-    pageListenersAttached = false;
   }
 }
 
@@ -900,20 +591,12 @@ function getDiagnostics() {
     ready: isReady,
     initializing: isInitializing,
     hasQR: !!currentQRBuffer,
-    lastEvent: lastEventName,
-    lastEventTime: lastEventTime?.toISOString() || null,
     initError,
     initAttempts,
     hasClient: !!client,
-    reconnectCount,
-    destroyCount,
-    pageListenersAttached,
     stats: { ...stats },
-    uptime: getUptime(),
-    memory: getFullMem(),
-    activeChecks: Array.from(activeChecks.entries()).map(([phone, v]) => ({
-      phone, step: v.step, elapsedMs: Date.now() - v.startTime,
-    })),
+    uptime: uptime(),
+    memory: memInfo(),
   };
 }
 
@@ -942,6 +625,5 @@ module.exports = {
   clearQR,
   getDiagnostics,
   getStats,
-  classifyError,
   emitter,
 };
