@@ -1,20 +1,17 @@
 /**
  * PUNTO DE ENTRADA PRINCIPAL
- * Inicializa GitHub, Telegram, WhatsApp y Monitor
- * Chrome se mantiene ONLINE 24/7
+ * Inicia WhatsApp PRIMERO, Telegram después
  */
 
 // ══════════════════════════════════════════
-// DIAGNÓSTICO TEMPORAL
+// DIAGNÓSTICO
 // ══════════════════════════════════════════
-console.log('--- DIAGNÓSTICO DE VARIABLES ---');
-console.log('TELEGRAM_BOT_TOKEN:', process.env.TELEGRAM_BOT_TOKEN ? `DEFINIDA (${process.env.TELEGRAM_BOT_TOKEN.length} chars)` : 'NO DEFINIDA');
-console.log('GITHUB_TOKEN:', process.env.GITHUB_TOKEN ? `DEFINIDA (${process.env.GITHUB_TOKEN.length} chars)` : 'NO DEFINIDA');
-console.log('GITHUB_OWNER:', process.env.GITHUB_OWNER || 'NO DEFINIDA');
-console.log('GITHUB_REPO:', process.env.GITHUB_REPO || 'NO DEFINIDA');
-console.log('ADMIN_TELEGRAM_ID:', process.env.ADMIN_TELEGRAM_ID || 'NO DEFINIDA');
-console.log('CHROME_PATH:', process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || 'NO DEFINIDA');
-console.log('--- FIN DIAGNÓSTICO ---');
+console.log('--- DIAGNÓSTICO ---');
+console.log('TELEGRAM_BOT_TOKEN:', process.env.TELEGRAM_BOT_TOKEN ? 'DEFINIDA' : 'NO');
+console.log('GITHUB_TOKEN:', process.env.GITHUB_TOKEN ? 'DEFINIDA' : 'NO');
+console.log('ADMIN_TELEGRAM_ID:', process.env.ADMIN_TELEGRAM_ID || 'NO');
+console.log('CHROME_PATH:', process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || 'NO');
+console.log('--- FIN ---\n');
 
 const config = require('./config');
 const { dbg } = config;
@@ -28,84 +25,214 @@ const qrModule = require('./qr');
 // ══════════════════════════════════════════
 // ERRORES GLOBALES
 // ══════════════════════════════════════════
-
 process.on('unhandledRejection', (error) => {
-  console.error('❌ Unhandled Rejection:', error);
-  dbg('GLOBAL', `Unhandled Rejection: ${error.message}`);
+  console.error('❌ Unhandled Rejection:', error?.message || error);
+});
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught Exception:', error?.message || error);
 });
 
-process.on('uncaughtException', (error) => {
-  console.error('❌ Uncaught Exception:', error);
-  dbg('GLOBAL', `Uncaught Exception: ${error.message}`);
-});
+// ══════════════════════════════════════════
+// HELPER: escapar HTML para Telegram
+// ══════════════════════════════════════════
+const esc = (s) =>
+  String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+// ══════════════════════════════════════════
+// ENVIAR QR AL ADMIN
+// ══════════════════════════════════════════
+async function sendQRToAdmin(qr) {
+  console.log('\n[MAIN] 📲 sendQRToAdmin() invocado');
+  console.log(`[MAIN] QR length: ${qr?.length}`);
+  console.log(`[MAIN] Admin ID: ${config.telegram.adminId}`);
+
+  try {
+    console.log('[MAIN] Generando imagen PNG...');
+    const buffer = await qrModule.generateQRImage(qr);
+    console.log(`[MAIN] Imagen generada: ${(buffer.length / 1024).toFixed(1)} KB`);
+
+    const caption =
+      '📲 <b>NUEVO CÓDIGO QR</b>\n\n' +
+      'Escanea con WhatsApp:\n' +
+      '1. Abre WhatsApp en tu celular\n' +
+      '2. Ajustes → Dispositivos vinculados\n' +
+      '3. Vincular un dispositivo\n\n' +
+      `⏰ ${new Date().toLocaleString('es-ES')}`;
+
+    console.log('[MAIN] Enviando foto a Telegram...');
+    await bot.telegram.sendPhoto(
+      config.telegram.adminId,
+      { source: buffer },
+      { caption, parse_mode: 'HTML' }
+    );
+    console.log('[MAIN] ✅ QR enviado al admin por Telegram\n');
+    return true;
+  } catch (e) {
+    console.error('[MAIN] ❌ Error enviando QR:', e.message);
+    console.error('[MAIN] Stack:', e.stack);
+
+    // Fallback: enviar como texto
+    try {
+      console.log('[MAIN] Intentando enviar QR como texto...');
+      await bot.telegram.sendMessage(
+        config.telegram.adminId,
+        `⚠️ No se pudo enviar el QR como imagen.\n\nError: ${esc(e.message)}\n\nIntenta /session de nuevo.`
+      );
+    } catch (e2) {
+      console.error('[MAIN] ❌ Fallback también falló:', e2.message);
+    }
+    return false;
+  }
+}
 
 // ══════════════════════════════════════════
 // FUNCIÓN PRINCIPAL
 // ══════════════════════════════════════════
-
 async function main() {
-  console.log('\n══════════════════════════════════════════════');
+  console.log('══════════════════════════════════════════════');
   console.log('  🤖 BanChecker Bot — Iniciando...');
   console.log('══════════════════════════════════════════════\n');
 
-  dbg('MAIN', 'Configuración cargada', {
-    owner: config.github.owner,
-    repo: config.github.repo,
-    adminId: config.telegram.adminId,
-    chromePath: config.whatsapp.chromePath,
-  });
-
   // ══════════════════════════════════════════
-  // 1. VERIFICAR GITHUB
+  // 1. GITHUB
   // ══════════════════════════════════════════
-  console.log('🐙 Verificando conexión con GitHub...');
-
+  console.log('🐙 Verificando GitHub...');
   try {
     const files = await github.listLogsFiles();
-    console.log(`✅ GitHub conectado (${files.length} archivos en logs/)\n`);
+    console.log(`✅ GitHub conectado (${files.length} archivos)\n`);
   } catch (e) {
-    console.error('❌ Error conectando con GitHub:', e.message);
-    console.log('\n💡 Verifica que:');
-    console.log('   1. El GITHUB_TOKEN sea válido');
-    console.log('   2. El repositorio exista');
-    console.log('   3. La carpeta logs/ exista\n');
+    console.error('❌ GitHub:', e.message);
     process.exit(1);
   }
 
   // ══════════════════════════════════════════
-  // 2. VERIFICAR / RESTAURAR SESIÓN
+  // 2. SESIÓN
   // ══════════════════════════════════════════
-  console.log('💾 Verificando sesión de WhatsApp...');
-
-  const hasLocal = sessionBackup.hasLocalSession();
-
-  if (hasLocal) {
-    console.log('✅ Sesión local encontrada, se usará esa\n');
+  console.log('💾 Verificando sesión...');
+  if (sessionBackup.hasLocalSession()) {
+    console.log('✅ Sesión local encontrada\n');
   } else {
-    console.log('⚠️ No hay sesión local, buscando backup en GitHub...');
-
+    console.log('⚠️ Sin sesión local, buscando backup...');
     try {
-      const hasRemote = await sessionBackup.hasRemoteBackup();
-
-      if (hasRemote) {
-        console.log('📥 Backup encontrado, restaurando...');
-        const result = await sessionBackup.restoreSession();
-
-        if (result.success) {
-          console.log(`✅ Sesión restaurada (${result.fileCount} archivos)\n`);
-        } else {
-          console.log(`⚠️ No se pudo restaurar: ${result.reason}\n`);
-        }
+      if (await sessionBackup.hasRemoteBackup()) {
+        console.log('📥 Restaurando backup...');
+        const r = await sessionBackup.restoreSession();
+        console.log(r.success ? `✅ Restaurada (${r.fileCount} archivos)\n` : `⚠️ ${r.reason}\n`);
       } else {
-        console.log('ℹ️ No hay backup remoto. Se pedirá QR.\n');
+        console.log('ℹ️ Sin backup. Se pedirá QR.\n');
       }
     } catch (e) {
-      console.log(`⚠️ Error buscando backup: ${e.message}\n`);
+      console.log(`⚠️ ${e.message}\n`);
     }
   }
 
   // ══════════════════════════════════════════
-  // 3. INICIAR BOT DE TELEGRAM
+  // 3. LISTENERS DE WHATSAPP (ANTES DE TODO)
+  // ══════════════════════════════════════════
+  console.log('[MAIN] Registrando listeners de WhatsApp...');
+
+  whatsapp.emitter.on('qr', async (qr) => {
+    console.log('\n[MAIN] ═══════════════════════════════');
+    console.log('[MAIN] 📲 Evento QR recibido del emitter');
+    console.log('[MAIN] ═══════════════════════════════');
+    await sendQRToAdmin(qr);
+  });
+
+  whatsapp.emitter.on('authenticated', () => {
+    console.log('\n[MAIN] ✅ WhatsApp autenticado\n');
+    qrModule.clearQR();
+  });
+
+  whatsapp.emitter.on('ready', async (info) => {
+    console.log(`\n[MAIN] ✅ WhatsApp LISTO: +${info?.wid?.user}\n`);
+
+    try {
+      await bot.telegram.sendMessage(
+        config.telegram.adminId,
+        `✅ <b>WhatsApp conectado</b>\n\n📞 +${info?.wid?.user}\n👤 ${esc(info?.pushname || 'N/A')}`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (e) {
+      console.error('[MAIN] Error notificando:', e.message);
+    }
+
+    setTimeout(async () => {
+      try {
+        const r = await sessionBackup.backupSession('Auto-backup [bot]', info?.wid?.user);
+        if (r.success) console.log(`[MAIN] ✅ Auto-backup OK (${r.sizeMB.toFixed(2)} MB)\n`);
+      } catch (e) {
+        console.error('[MAIN] Error auto-backup:', e.message);
+      }
+    }, 15000);
+  });
+
+  whatsapp.emitter.on('disconnected', (reason) => {
+    console.log(`\n[MAIN] ❌ WhatsApp desconectado: ${reason}\n`);
+    bot.telegram.sendMessage(
+      config.telegram.adminId,
+      `⚠️ <b>WhatsApp desconectado</b>\n\nMotivo: ${esc(reason)}`,
+      { parse_mode: 'HTML' }
+    ).catch(() => {});
+  });
+
+  whatsapp.emitter.on('auth_failure', (msg) => {
+    console.log(`\n[MAIN] ❌ Fallo auth: ${msg}\n`);
+    bot.telegram.sendMessage(
+      config.telegram.adminId,
+      `❌ <b>Fallo de autenticación</b>\n\n${esc(msg)}`,
+      { parse_mode: 'HTML' }
+    ).catch(() => {});
+  });
+
+  console.log('[MAIN] ✅ Listeners registrados\n');
+
+  // ══════════════════════════════════════════
+  // 4. INICIAR WHATSAPP
+  // ══════════════════════════════════════════
+  console.log('📱 Iniciando WhatsApp (Chrome)...');
+  console.log('   ⏳ Puede tardar 1-3 minutos\n');
+
+  whatsapp.initializeWhatsApp()
+    .then(() => console.log('[MAIN] ✅ WhatsApp inicializado\n'))
+    .catch((e) => {
+      console.error('[MAIN] ❌ Error inicializando WhatsApp:', e.message);
+      console.error(e.stack);
+    });
+
+  // ══════════════════════════════════════════
+  // 5. TIMEOUT: Si en 3 min no hay QR ni conexión → forzar restart
+  // ══════════════════════════════════════════
+  setTimeout(async () => {
+    try {
+      const diag = whatsapp.getDiagnostics();
+
+      if (!diag.ready && !diag.hasQR) {
+        console.log('\n[MAIN] ⚠️ 3 min sin QR ni conexión. Forzando restart...');
+        console.log('[MAIN] Diag:', JSON.stringify(diag, null, 2));
+
+        try {
+          await bot.telegram.sendMessage(
+            config.telegram.adminId,
+            `⚠️ <b>WhatsApp no responde</b>\n\n` +
+            `Evento: <code>${esc(diag.lastEvent)}</code>\n` +
+            `Error: ${esc(diag.initError || 'ninguno')}\n\n` +
+            `🔄 Forzando reinicio...`,
+            { parse_mode: 'HTML' }
+          );
+        } catch {}
+
+        await whatsapp.restartForQR();
+      }
+    } catch (e) {
+      console.error('[MAIN] Error en timeout restart:', e.message);
+    }
+  }, 3 * 60 * 1000);
+
+  // ══════════════════════════════════════════
+  // 6. TELEGRAM
   // ══════════════════════════════════════════
   console.log('🤖 Iniciando bot de Telegram...');
 
@@ -113,197 +240,57 @@ async function main() {
     await bot.launch();
     console.log('✅ Bot de Telegram iniciado\n');
   } catch (e) {
-    console.error('❌ Error iniciando bot:', e.message);
-    process.exit(1);
+    console.error('❌ Error Telegram:', e.message);
   }
 
   // ══════════════════════════════════════════
-  // 4. LISTENERS DEL EMITTER DE WHATSAPP
-  //    (ANTES de inicializar WhatsApp)
-  // ══════════════════════════════════════════
-
-  // ── QR ─────────────────────────────────────
-  whatsapp.emitter.on('qr', async (qr) => {
-    dbg('MAIN', '📲 QR emitido, enviando a Telegram...');
-    console.log('\n📲 QR recibido, enviando imagen a Telegram...\n');
-
-    const sent = await qrModule.sendQRToAdmin(bot, qr);
-
-    if (sent) {
-      console.log('✅ QR enviado al admin por Telegram\n');
-    } else {
-      console.log('⚠️ No se pudo enviar el QR por Telegram.');
-      console.log('   Usa /session en Telegram para verlo.\n');
-    }
-  });
-
-  // ── Autenticado ────────────────────────────
-  whatsapp.emitter.on('authenticated', () => {
-    dbg('MAIN', '✅ Autenticado, el QR ya no es válido');
-    qrModule.clearQR();
-  });
-
-  // ── Listo ──────────────────────────────────
-  whatsapp.emitter.on('ready', async (info) => {
-    dbg('MAIN', `✅ WhatsApp listo: +${info?.wid?.user}`);
-
-    try {
-      await bot.telegram.sendMessage(
-        config.telegram.adminId,
-        `✅ *WhatsApp conectado*\n\n` +
-        `📞 Número: \`+${info?.wid?.user}\`\n` +
-        `👤 Nombre: ${info?.pushname || 'N/A'}\n\n` +
-        `⏰ ${new Date().toLocaleString('es-ES')}`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (e) {
-      dbg('MAIN', `Error notificando conexión: ${e.message}`);
-    }
-
-    // Backup automático tras 15s
-    setTimeout(async () => {
-      dbg('MAIN', 'Iniciando backup automático de sesión...');
-      try {
-        const result = await sessionBackup.backupSession('Auto-backup on ready [bot]');
-        if (result.success) {
-          dbg('MAIN', `✅ Auto-backup OK (${result.sizeMB.toFixed(2)} MB)`);
-        } else {
-          dbg('MAIN', `⚠️ Auto-backup falló: ${result.reason}`);
-        }
-      } catch (e) {
-        dbg('MAIN', `❌ Error auto-backup: ${e.message}`);
-      }
-    }, 15000);
-  });
-
-  // ── Desconectado ───────────────────────────
-  whatsapp.emitter.on('disconnected', (reason) => {
-    dbg('MAIN', `❌ WhatsApp desconectado: ${reason}`);
-
-    bot.telegram.sendMessage(
-      config.telegram.adminId,
-      `⚠️ *WhatsApp desconectado*\n\n` +
-      `Motivo: ${reason}\n\n` +
-      `Usa /session para ver el estado.`,
-      { parse_mode: 'Markdown' }
-    ).catch(() => {});
-  });
-
-  // ── Fallo auth ─────────────────────────────
-  whatsapp.emitter.on('auth_failure', (msg) => {
-    dbg('MAIN', `❌ Fallo de autenticación: ${msg}`);
-
-    bot.telegram.sendMessage(
-      config.telegram.adminId,
-      `❌ *Fallo de autenticación*\n\n${msg}\n\n` +
-      `Usa /session logout y reinicia para generar un QR nuevo.`,
-      { parse_mode: 'Markdown' }
-    ).catch(() => {});
-  });
-
-  // ══════════════════════════════════════════
-  // 5. INICIALIZAR WHATSAPP (NO BLOQUEANTE)
-  // ══════════════════════════════════════════
-  console.log('📱 Inicializando WhatsApp...');
-  console.log('   (El QR se enviará por Telegram al admin)\n');
-
-  // Lanzar en background para que el bot siga respondiendo
-  whatsapp.initializeWhatsApp()
-    .then(() => {
-      console.log('✅ WhatsApp conectado\n');
-    })
-    .catch((e) => {
-      console.error('❌ Error inicializando WhatsApp:', e.message);
-      console.log('\n💡 Posibles soluciones:');
-      console.log('   1. Verifica que Chrome esté instalado');
-      console.log('   2. Usa /session logout en Telegram');
-      console.log('   3. Verifica que el Volume esté montado en /app/wa_session\n');
-
-      bot.telegram.sendMessage(
-        config.telegram.adminId,
-        `❌ *Error inicializando WhatsApp*\n\n${e.message}`,
-        { parse_mode: 'Markdown' }
-      ).catch(() => {});
-    });
-
-  // ══════════════════════════════════════════
-  // 6. INICIAR MONITOR
+  // 7. MONITOR
   // ══════════════════════════════════════════
   console.log('⏰ Iniciando monitor...');
-
   try {
     await monitor.startMonitor(bot);
-    console.log('✅ Monitor iniciado (intervalo: 60s)\n');
+    console.log('✅ Monitor iniciado (60s)\n');
   } catch (e) {
-    console.error('❌ Error iniciando monitor:', e.message);
+    console.error('❌ Monitor:', e.message);
   }
 
   // ══════════════════════════════════════════
-  // 7. BACKUP PERIÓDICO CADA 6 HORAS
+  // 8. BACKUP PERIÓDICO (cada 6h)
   // ══════════════════════════════════════════
   setInterval(async () => {
-    dbg('MAIN', '🔄 Backup periódico de sesión...');
     try {
-      await sessionBackup.backupSession('Periodic backup [bot]');
+      const info = whatsapp.getClient()?.info;
+      await sessionBackup.backupSession('Periodic backup [bot]', info?.wid?.user);
     } catch (e) {
-      dbg('MAIN', `Error backup periódico: ${e.message}`);
+      dbg('MAIN', `Error backup: ${e.message}`);
     }
   }, 6 * 60 * 60 * 1000);
 
   // ══════════════════════════════════════════
-  // 8. MENSAJE FINAL
+  // 9. FIN
   // ══════════════════════════════════════════
   console.log('══════════════════════════════════════════════');
-  console.log('  ✅ BOT INICIADO');
-  console.log('══════════════════════════════════════════════');
-  console.log(`  🤖 Telegram: Activo`);
-  console.log(`  📱 WhatsApp: Inicializando en background`);
-  console.log(`  ⏰ Monitor: Cada 60 segundos`);
-  console.log(`  💾 Backup: Automático cada 6h`);
-  console.log(`  🆔 Admin: ${config.telegram.adminId}`);
+  console.log('  ✅ BOT OPERATIVO');
   console.log('══════════════════════════════════════════════\n');
-
-  dbg('MAIN', 'Bot completamente iniciado');
 }
 
 // ══════════════════════════════════════════
-// CIERRE GRACEFUL
+// SHUTDOWN
 // ══════════════════════════════════════════
-
 async function shutdown(signal) {
-  console.log(`\n⏹️ Recibida señal ${signal}, cerrando...`);
-
+  console.log(`\n⏹️ Cerrando (${signal})...`);
   monitor.stopMonitor();
-
   try {
-    console.log('💾 Backup de sesión antes de cerrar...');
-    await sessionBackup.backupSession('Shutdown backup [bot]');
-  } catch (e) {
-    dbg('SHUTDOWN', `Error backup en shutdown: ${e.message}`);
-  }
-
-  try {
-    await bot.stop(signal);
-  } catch (e) {
-    dbg('SHUTDOWN', `Error deteniendo bot: ${e.message}`);
-  }
-
-  try {
-    await whatsapp.destroyClient();
-  } catch (e) {
-    dbg('SHUTDOWN', `Error destruyendo WhatsApp: ${e.message}`);
-  }
-
-  console.log('👋 Hasta luego\n');
+    const info = whatsapp.getClient()?.info;
+    await sessionBackup.backupSession('Shutdown [bot]', info?.wid?.user);
+  } catch {}
+  try { await bot.stop(signal); } catch {}
+  try { await whatsapp.destroyClient(); } catch {}
   process.exit(0);
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-// ══════════════════════════════════════════
-// EJECUTAR
-// ══════════════════════════════════════════
 
 main().catch(e => {
   console.error('❌ Error fatal:', e);
