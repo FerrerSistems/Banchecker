@@ -55,10 +55,13 @@ function createClient() {
 
   if (!chromePath) {
     console.error('❌ No se encontró Chrome/Chromium.');
+    console.error('   Instala Chrome o especifica CHROME_PATH en las variables.');
     process.exit(1);
   }
 
-  const client = new Client({
+  dbg('WHATSAPP', `Usando Chrome: ${chromePath}`);
+
+  const newClient = new Client({
     authStrategy: new LocalAuth({
       clientId: config.whatsapp.sessionId,
       dataPath: config.whatsapp.sessionPath,
@@ -91,43 +94,41 @@ function createClient() {
   // EVENTOS DEL CLIENTE
   // ══════════════════════════════════════════
 
-  client.on('qr', (qr) => {
+  newClient.on('qr', (qr) => {
     dbg('WHATSAPP', '📲 QR recibido');
     currentQR = qr;
 
-    // Mostrar en terminal (por si alguien mira los logs)
     if (!qrDisplayed) {
       console.log('\n📲 QR recibido (también enviado por Telegram al admin)\n');
       qrcode.generate(qr, { small: true });
       qrDisplayed = true;
     }
 
-    // Emitir evento para que index.js lo envíe por Telegram
     emitter.emit('qr', qr);
   });
 
-  client.on('loading_screen', (percent, message) => {
+  newClient.on('loading_screen', (percent, message) => {
     dbg('WHATSAPP', `Cargando ${percent}% — ${message}`);
   });
 
-  client.on('authenticated', () => {
+  newClient.on('authenticated', () => {
     dbg('WHATSAPP', '✅ Autenticado');
     console.log('\n✅ Autenticado — guardando sesión...');
     emitter.emit('authenticated');
   });
 
-  client.on('auth_failure', (msg) => {
+  newClient.on('auth_failure', (msg) => {
     console.error(`\n❌ Fallo de autenticación: ${msg}`);
     isReady = false;
     emitter.emit('auth_failure', msg);
   });
 
-  client.on('ready', () => {
+  newClient.on('ready', () => {
     dbg('WHATSAPP', '✅ Cliente listo');
     isReady = true;
     qrDisplayed = false;
 
-    const info = client.info;
+    const info = newClient.info;
     console.log(`\n✅ WhatsApp conectado como: +${info?.wid?.user}`);
     console.log(`   Nombre: ${info?.pushname}`);
 
@@ -137,20 +138,188 @@ function createClient() {
     readyResolvers = [];
   });
 
-  client.on('disconnected', (reason) => {
+  newClient.on('disconnected', (reason) => {
     dbg('WHATSAPP', `❌ Desconectado: ${reason}`);
     isReady = false;
     client = null;
     emitter.emit('disconnected', reason);
   });
 
-  return client;
+  return newClient;
 }
 
-// ... el resto del archivo (initializeWhatsApp, getReadyClient, checkNumberStatus, isNumberBanned, destroyClient) queda EXACTAMENTE IGUAL ...
+// ══════════════════════════════════════════
+// INICIALIZAR WHATSAPP
+// ══════════════════════════════════════════
+
+async function initializeWhatsApp() {
+  if (client && isReady) return client;
+
+  client = createClient();
+
+  dbg('WHATSAPP', 'Inicializando...');
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('Timeout de inicialización (5 minutos)'));
+    }, 5 * 60 * 1000);
+
+    readyResolvers.push(() => {
+      clearTimeout(timeout);
+      resolve(client);
+    });
+
+    client.initialize().catch(e => {
+      clearTimeout(timeout);
+      reject(e);
+    });
+  });
+}
 
 // ══════════════════════════════════════════
-// EXPORTAR (actualizado con emitter)
+// OBTENER CLIENTE LISTO
+// ══════════════════════════════════════════
+
+async function getReadyClient() {
+  if (client && isReady) return client;
+
+  if (!client) {
+    return initializeWhatsApp();
+  }
+
+  return new Promise((resolve) => {
+    readyResolvers.push(() => resolve(client));
+  });
+}
+
+// ══════════════════════════════════════════
+// VERIFICAR ESTADO DE UN NÚMERO
+// ══════════════════════════════════════════
+
+async function checkNumberStatus(phone) {
+  const c = await getReadyClient();
+  const chatId = `${phone}@c.us`;
+
+  dbg('CHECK', `Verificando ${chatId}...`);
+
+  try {
+    const contact = await c.getContactById(chatId);
+
+    if (!contact.isWAContact) {
+      return {
+        status: 'PERMANENT_BAN',
+        message: '❌ Registrar nuevo — baneo permanente',
+        raw: {
+          isWAContact: false,
+          isUser: contact.isUser,
+          isBusiness: contact.isBusiness,
+          number: contact.number,
+        },
+      };
+    }
+
+    try {
+      const chat = await c.getChatById(chatId);
+
+      if (chat && chat.name) {
+        return {
+          status: 'ACTIVE',
+          message: '✅ Número activo',
+          raw: {
+            name: chat.name,
+            isWAContact: true,
+            isUser: contact.isUser,
+          },
+        };
+      }
+
+      return {
+        status: 'VERIFY',
+        message: '🔄 Verificar estado',
+        raw: {
+          chatExists: true,
+          isWAContact: true,
+        },
+      };
+    } catch (chatError) {
+      const errMsg = chatError.message.toLowerCase();
+
+      if (errMsg.includes('request review') || errMsg.includes('review')) {
+        return {
+          status: 'TEMPORARY_BAN',
+          message: '⚠️ Solicitar revisión — baneo temporal',
+          raw: { error: chatError.message },
+        };
+      }
+
+      if (errMsg.includes('ban spam') || errMsg.includes('spam')) {
+        return {
+          status: 'SPAM_BAN',
+          message: '🚫 Ban por spam detectado',
+          raw: { error: chatError.message },
+        };
+      }
+
+      if (errMsg.includes('not registered') || errMsg.includes('invalid')) {
+        return {
+          status: 'PERMANENT_BAN',
+          message: '❌ Registrar nuevo — baneo permanente',
+          raw: { error: chatError.message },
+        };
+      }
+
+      return {
+        status: 'UNKNOWN',
+        message: `❓ Estado desconocido: ${chatError.message}`,
+        raw: { error: chatError.message },
+      };
+    }
+  } catch (e) {
+    const errMsg = e.message.toLowerCase();
+
+    if (errMsg.includes('not found') || errMsg.includes('invalid')) {
+      return {
+        status: 'PERMANENT_BAN',
+        message: '❌ Registrar nuevo — baneo permanente',
+        raw: { error: e.message },
+      };
+    }
+
+    return {
+      status: 'ERROR',
+      message: `❌ Error: ${e.message}`,
+      raw: { error: e.message },
+    };
+  }
+}
+
+// ══════════════════════════════════════════
+// VERIFICAR SI UN NÚMERO ESTÁ BANEADO
+// ══════════════════════════════════════════
+
+async function isNumberBanned(phone) {
+  const result = await checkNumberStatus(phone);
+  return result.status !== 'ACTIVE';
+}
+
+// ══════════════════════════════════════════
+// DESTRUIR CLIENTE
+// ══════════════════════════════════════════
+
+async function destroyClient() {
+  if (client) {
+    try {
+      await client.destroy();
+    } catch (e) {
+      dbg('WHATSAPP', `Error al destruir: ${e.message}`);
+    }
+    client = null;
+    isReady = false;
+  }
+}
+
+// ══════════════════════════════════════════
+// EXPORTAR
 // ══════════════════════════════════════════
 
 module.exports = {
@@ -163,5 +332,5 @@ module.exports = {
   getClient: () => client,
   isReady: () => isReady,
   getQR: () => currentQR,
-  emitter, // ← NUEVO
+  emitter,
 };
