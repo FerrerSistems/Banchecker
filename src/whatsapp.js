@@ -720,53 +720,69 @@ async function checkViaGetNumberId(c, phone) {
 // ══════════════════════════════════════════
 // CHECK NUMBER STATUS
 // ══════════════════════════════════════════
-
 async function checkNumberStatus(phone) {
   const totalStart = Date.now();
 
   log('CHECK', '════════════════════════════════════════');
   log('CHECK', `VERIFICANDO: ${phone}`);
-  log('CHECK', `Check #${stats.totalChecks + 1} | Fallos consecutivos: ${stats.consecutiveFailures}`);
+  log('CHECK', `ready=${isReady}, initializing=${isInitializing}, hasQR=${!!currentQRBuffer}`);
   log('CHECK', '════════════════════════════════════════');
 
-  activeChecks.set(phone, { startTime: totalStart, step: 'init' });
-  stats.totalChecks++;
+  // ══════════════════════════════════════════
+  // PASO 0: VERIFICAR ESTADO ANTES DE NADA
+  // ══════════════════════════════════════════
+  if (!isReady) {
+    const elapsed = Date.now() - totalStart;
+    logError('CHECK', `WhatsApp no listo (ready=${isReady}). Abortando.`);
 
-  // PASO 1: Cliente
-  log('CHECK', '[PASO 1/4] Obteniendo cliente...');
-  let c;
-  try {
-    c = await withTimeout(getReadyClient(), 30000, 'get_ready_client');
-  } catch (e) {
-    stats.failedChecks++;
-    stats.consecutiveFailures++;
-    if (stats.consecutiveFailures > stats.maxConsecutiveFailures) {
-      stats.maxConsecutiveFailures = stats.consecutiveFailures;
+    let message = '❌ <b>WhatsApp no está conectado</b>\n\n';
+
+    if (currentQRBuffer) {
+      message += '📲 Hay un QR pendiente.\n\n' +
+                 '💡 Usa <code>/session</code> para recibirlo y escanearlo.';
+    } else if (isInitializing) {
+      message += '⏳ WhatsApp se está inicializando.\n\n' +
+                 '💡 Espera 1-2 minutos y usa <code>/session</code> para ver el QR.';
+    } else if (!client) {
+      message += '💡 Usa <code>/session</code> para generar un QR y conectar WhatsApp.';
+    } else {
+      message += '💡 Usa <code>/session</code> para ver el estado.';
     }
-    activeChecks.delete(phone);
-    const kind = classifyError(e);
+
     return {
-      status: 'ERROR',
-      message: `❌ WhatsApp no responde [${kind}]`,
-      raw: { error: e.message, kind, step: 'get_client' },
+      status: 'NOT_CONNECTED',
+      message: message.replace(/<[^>]+>/g, ''), // sin HTML por si acaso
+      raw: {
+        ready: isReady,
+        initializing: isInitializing,
+        hasQR: !!currentQRBuffer,
+        hasClient: !!client,
+        elapsedMs: elapsed,
+      },
     };
   }
 
-  if (!c || !isReady) {
-    stats.failedChecks++;
-    stats.consecutiveFailures++;
-    activeChecks.delete(phone);
+  // ══════════════════════════════════════════
+  // PASO 1: OBTENER CLIENTE (ya listo)
+  // ══════════════════════════════════════════
+  log('CHECK', '[PASO 1/3] Obteniendo cliente...');
+  const c = client;
+
+  if (!c) {
+    logError('CHECK', 'Cliente null pese a isReady=true');
     return {
       status: 'ERROR',
-      message: '❌ WhatsApp no está listo',
-      raw: { error: 'client_not_ready' },
+      message: '❌ Cliente no disponible',
+      raw: { error: 'client_null_but_ready' },
     };
   }
 
-  log('CHECK', `✅ PASO 1 OK (${Date.now() - totalStart}ms)`);
+  log('CHECK', `✅ Cliente OK (${Date.now() - totalStart}ms)`);
 
-  // PASO 2: Store
-  log('CHECK', '[PASO 2/4] Verificando vía store...');
+  // ══════════════════════════════════════════
+  // PASO 2: STORE
+  // ══════════════════════════════════════════
+  log('CHECK', '[PASO 2/3] Verificando vía store...');
   const storeResult = await checkViaStore(c, phone);
 
   if (storeResult.ok) {
@@ -774,20 +790,14 @@ async function checkNumberStatus(phone) {
     stats.consecutiveFailures = 0;
     const data = storeResult.data;
     const elapsed = Date.now() - totalStart;
-    stats.avgStoreMs = stats.avgStoreMs === 0 ? elapsed : (stats.avgStoreMs + elapsed) / 2;
+
+    log('CHECK', `✅ Store OK (${elapsed}ms) — método: ${data.method}`);
+    log('CHECK', `isWAContact: ${data.isWAContact}, name: ${data.name || data.pushname}`);
+
+    stats.successChecks++;
     stats.avgTotalMs = stats.avgTotalMs === 0 ? elapsed : (stats.avgTotalMs + elapsed) / 2;
 
-    log('CHECK', `✅ PASO 2 OK (${elapsed}ms) — método: ${data.method}`);
-    log('CHECK', `isWAContact: ${data.isWAContact}`);
-    log('CHECK', `isUser: ${data.isUser}`);
-    log('CHECK', `isBlocked: ${data.isBlocked}`);
-    log('CHECK', `name: ${data.name}`);
-    log('CHECK', `pushname: ${data.pushname}`);
-
     if (!data.isWAContact) {
-      stats.successChecks++;
-      activeChecks.delete(phone);
-      log('CHECK', '❌ PERMANENT_BAN (no es contacto)');
       return {
         status: 'PERMANENT_BAN',
         message: '❌ No está registrado en WhatsApp',
@@ -796,9 +806,6 @@ async function checkNumberStatus(phone) {
     }
 
     if (data.isBlocked) {
-      stats.successChecks++;
-      activeChecks.delete(phone);
-      log('CHECK', '⚠️ Está bloqueado por ti → ACTIVE');
       return {
         status: 'ACTIVE',
         message: '✅ Número activo (bloqueado por ti)',
@@ -806,9 +813,6 @@ async function checkNumberStatus(phone) {
       };
     }
 
-    stats.successChecks++;
-    activeChecks.delete(phone);
-    log('CHECK', `✅ ACTIVO — ${data.name || data.pushname || 'sin nombre'}`);
     return {
       status: 'ACTIVE',
       message: '✅ Número activo',
@@ -816,23 +820,22 @@ async function checkNumberStatus(phone) {
     };
   }
 
-  // PASO 3: getNumberId
+  // ══════════════════════════════════════════
+  // PASO 3: FALLBACK
+  // ══════════════════════════════════════════
   stats.storeFail++;
-  log('CHECK', `⚠️ PASO 2 FALLÓ: ${storeResult.reason}`);
-  log('CHECK', '[PASO 3/4] Probando getNumberId...');
+  log('CHECK', `⚠️ Store falló (${storeResult.reason}). Fallback...`);
+  log('CHECK', '[PASO 3/3] getNumberId...');
 
   const fallbackResult = await checkViaGetNumberId(c, phone);
 
   if (fallbackResult.ok) {
-    stats.fallbackSuccess++;
     const elapsed = Date.now() - totalStart;
-    stats.avgFallbackMs = stats.avgFallbackMs === 0 ? elapsed : (stats.avgFallbackMs + elapsed) / 2;
+    stats.fallbackSuccess++;
 
     if (!fallbackResult.exists) {
       stats.successChecks++;
       stats.consecutiveFailures = 0;
-      activeChecks.delete(phone);
-      log('CHECK', `❌ No existe (${elapsed}ms)`);
       return {
         status: 'PERMANENT_BAN',
         message: '❌ No está registrado en WhatsApp',
@@ -842,8 +845,6 @@ async function checkNumberStatus(phone) {
 
     stats.successChecks++;
     stats.consecutiveFailures = 0;
-    activeChecks.delete(phone);
-    log('CHECK', `✅ ACTIVO (${elapsed}ms)`);
     return {
       status: 'ACTIVE',
       message: '✅ Número activo',
@@ -851,20 +852,17 @@ async function checkNumberStatus(phone) {
     };
   }
 
-  // PASO 4: Todo falló
+  // ══════════════════════════════════════════
+  // TODO FALLÓ
+  // ══════════════════════════════════════════
   stats.fallbackFail++;
   stats.failedChecks++;
   stats.consecutiveFailures++;
-  if (stats.consecutiveFailures > stats.maxConsecutiveFailures) {
-    stats.maxConsecutiveFailures = stats.consecutiveFailures;
-  }
 
   const elapsed = Date.now() - totalStart;
-  logError('CHECK', `❌ TODOS los métodos fallaron (${elapsed}ms)`);
-  logError('CHECK', `  store: ${storeResult.reason} — ${storeResult.error || 'N/A'}`);
-  logError('CHECK', `  fallback: ${fallbackResult.reason} — ${fallbackResult.error || 'N/A'}`);
-  log('CHECK', '📊 Stats:', stats);
-  activeChecks.delete(phone);
+  logError('CHECK', `❌ Todo falló (${elapsed}ms)`);
+  logError('CHECK', `  store: ${storeResult.reason}`);
+  logError('CHECK', `  fallback: ${fallbackResult.reason}`);
 
   return {
     status: 'ERROR',
@@ -873,7 +871,6 @@ async function checkNumberStatus(phone) {
       storeError: storeResult.error || storeResult.reason,
       fallbackError: fallbackResult.error || fallbackResult.reason,
       elapsedMs: elapsed,
-      consecutiveFailures: stats.consecutiveFailures,
     },
   };
 }
