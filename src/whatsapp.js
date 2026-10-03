@@ -1,10 +1,8 @@
 /**
- * MÓDULO WHATSAPP — v9 FINAL
- * - Watchdog de página cada 30s
- * - Solo getNumberId (más ligero)
- * - Reconnect automático si la página se atasca
- * - Cola serial (nunca 2 checks a la vez)
- * - Interpretación correcta de timeouts
+ * MÓDULO WHATSAPP — v10
+ * - Health check + getNumberId + isRegisteredUser en cascada
+ * - Distingue suspensión real de página atascada
+ * - Watchdog + reconnect automático
  */
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
@@ -33,7 +31,6 @@ let reconnectAttempts = 0;
 let lastAuthFailure = null;
 let lastDisconnectReason = null;
 
-// Watchdog
 let watchdogInterval = null;
 let pageHealthy = true;
 let consecutiveHealthFailures = 0;
@@ -53,7 +50,6 @@ const stats = {
   qrRegens: 0,
   watchdogChecks: 0,
   watchdogFails: 0,
-  pageReconnects: 0,
   avgCheckMs: 0,
   startTime: Date.now(),
 };
@@ -64,17 +60,12 @@ const stats = {
 
 function memInfo() {
   const m = process.memoryUsage();
-  return {
-    heap: (m.heapUsed / 1024 / 1024).toFixed(1),
-    rss: (m.rss / 1024 / 1024).toFixed(1),
-  };
+  return { heap: (m.heapUsed / 1024 / 1024).toFixed(1), rss: (m.rss / 1024 / 1024).toFixed(1) };
 }
 
 function uptime() {
   const s = Math.floor(process.uptime());
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  return `${h}h${m}m${s % 60}s`;
+  return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m${s % 60}s`;
 }
 
 function log(tag, msg, data) {
@@ -91,8 +82,7 @@ function logError(tag, msg, err) {
     if (err.message) console.error(`[${tag}]   message: ${err.message}`);
     if (err.label) console.error(`[${tag}]   label: ${err.label}`);
     if (err.stack) {
-      const lines = err.stack.split('\n').slice(0, 5);
-      lines.forEach(l => console.error(`[${tag}]   ${l.trim()}`));
+      err.stack.split('\n').slice(0, 5).forEach(l => console.error(`[${tag}]   ${l.trim()}`));
     }
   }
 }
@@ -117,21 +107,9 @@ function withTimeout(promise, ms, label) {
     }, ms);
 
     promise.then(
-      (v) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeoutId);
-        resolve(v);
-      },
-      (e) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeoutId);
-        reject(e);
-      }
-    ).catch((e) => {
-      log('TIMEOUT', `Error tardío en "${label}": ${e.message}`);
-    });
+      (v) => { if (!settled) { settled = true; clearTimeout(timeoutId); resolve(v); } },
+      (e) => { if (!settled) { settled = true; clearTimeout(timeoutId); reject(e); } }
+    ).catch((e) => log('TIMEOUT', `Error tardío en "${label}": ${e.message}`));
   });
 }
 
@@ -175,21 +153,17 @@ function hasSessionOnDisk() {
     if (!fs.existsSync(laDir)) return false;
     const defaultDir = path.join(laDir, 'Default');
     if (!fs.existsSync(defaultDir)) return false;
-    const localState = path.join(defaultDir, 'Local Storage');
-    const preferences = path.join(defaultDir, 'Preferences');
-    return fs.existsSync(localState) || fs.existsSync(preferences);
-  } catch (e) {
-    return false;
-  }
+    return fs.existsSync(path.join(defaultDir, 'Local Storage')) ||
+           fs.existsSync(path.join(defaultDir, 'Preferences'));
+  } catch (e) { return false; }
 }
 
 // ══════════════════════════════════════════
-// ⭐ HEALTH CHECK (rápido, ligero)
+// HEALTH CHECK
 // ══════════════════════════════════════════
 
 async function healthCheckPage() {
   if (!client || !client.pupPage) return false;
-
   try {
     const result = await withTimeout(
       client.pupPage.evaluate(() => 1 + 1),
@@ -203,12 +177,12 @@ async function healthCheckPage() {
 }
 
 // ══════════════════════════════════════════
-// ⭐ WATCHDOG (vigila la página cada 30s)
+// WATCHDOG
 // ══════════════════════════════════════════
 
 function startWatchdog() {
   if (watchdogInterval) return;
-  log('WATCHDOG', 'Iniciando watchdog (cada 30s)');
+  log('WATCHDOG', 'Iniciando watchdog (30s)');
 
   watchdogInterval = setInterval(async () => {
     if (!isReady || !client) return;
@@ -218,26 +192,19 @@ function startWatchdog() {
     lastHealthCheck = new Date();
 
     if (healthy) {
-      if (!pageHealthy) {
-        log('WATCHDOG', '✅ Página recuperada');
-        pageHealthy = true;
-      }
+      if (!pageHealthy) log('WATCHDOG', '✅ Página recuperada');
+      pageHealthy = true;
       consecutiveHealthFailures = 0;
     } else {
       consecutiveHealthFailures++;
       stats.watchdogFails++;
-      log('WATCHDOG', `⚠️ Página no responde (fallo ${consecutiveHealthFailures}/2)`);
+      log('WATCHDOG', `⚠️ Fallo ${consecutiveHealthFailures}/2`);
 
       if (consecutiveHealthFailures >= 2 && pageHealthy) {
         pageHealthy = false;
-        log('WATCHDOG', '🚨 Página MUERTA. Programando reconnect...');
-
+        log('WATCHDOG', '🚨 Página MUERTA. Reconnect...');
         setImmediate(async () => {
-          try {
-            await reconnect();
-          } catch (e) {
-            logError('WATCHDOG', 'Error reconnect', e);
-          }
+          try { await reconnect(); } catch (e) { logError('WATCHDOG', 'Error reconnect', e); }
         });
       }
     }
@@ -248,7 +215,6 @@ function stopWatchdog() {
   if (watchdogInterval) {
     clearInterval(watchdogInterval);
     watchdogInterval = null;
-    log('WATCHDOG', '⏹️ Watchdog detenido');
   }
 }
 
@@ -270,14 +236,14 @@ function createClient(clearSession = false) {
   if (clearSession) {
     const sessionDir = config.whatsapp.sessionPath;
     if (fs.existsSync(sessionDir)) {
-      log('WHATSAPP', '🗑️ Limpiando sesión (clearSession=true)');
+      log('WHATSAPP', '🗑️ Limpiando sesión');
       try {
         fs.rmSync(sessionDir, { recursive: true, force: true });
         fs.mkdirSync(sessionDir, { recursive: true });
       } catch (e) {}
     }
   } else {
-    log('WHATSAPP', `📁 Preservando sesión. Existe: ${hasSessionOnDisk()}`);
+    log('WHATSAPP', `📁 Preservando. Existe: ${hasSessionOnDisk()}`);
   }
 
   const newClient = new Client({
@@ -322,7 +288,7 @@ function createClient(clearSession = false) {
       });
       log('WHATSAPP', `💾 QR buffer: ${(currentQRBuffer.length / 1024).toFixed(1)}KB`);
     } catch (e) {
-      logError('WHATSAPP', 'Error buffer QR', e);
+      logError('WHATSAPP', 'Error QR', e);
       currentQRBuffer = null;
     }
   });
@@ -363,11 +329,9 @@ function createClient(clearSession = false) {
     log('WHATSAPP', `Número: +${info?.wid?.user}`);
     log('WHATSAPP', `Nombre: ${info?.pushname}`);
 
-    // Esperar 30s antes de considerar la página "usable"
-    // (WhatsApp Web hace sync intenso los primeros segundos)
-    log('WHATSAPP', '⏳ Esperando 30s de estabilización antes de marcar como usable...');
+    log('WHATSAPP', '⏳ Esperando 30s de estabilización...');
     setTimeout(() => {
-      log('WHATSAPP', '✅ Página estable. Lista para consultas.');
+      log('WHATSAPP', '✅ Estable. Listo.');
       startWatchdog();
     }, 30000);
 
@@ -388,7 +352,7 @@ function createClient(clearSession = false) {
   });
 
   newClient.on('error', (err) => {
-    logError('WHATSAPP', `EVENTO ERROR: ${err.message}`, err);
+    logError('WHATSAPP', `ERROR: ${err.message}`, err);
     initError = err.message;
   });
 
@@ -403,11 +367,8 @@ async function initializeWhatsApp(clearSession = false) {
   log('WHATSAPP', `═══ INICIALIZANDO (clearSession=${clearSession}) ═══`);
 
   if (client && isReady && !clearSession) return client;
-
   if (isInitializing) {
-    return new Promise((resolve) => {
-      readyResolvers.push(() => resolve(client));
-    });
+    return new Promise((resolve) => readyResolvers.push(() => resolve(client)));
   }
 
   initAttempts++;
@@ -435,7 +396,7 @@ async function initializeWhatsApp(clearSession = false) {
     const timeout = setTimeout(() => {
       logError('WHATSAPP', `TIMEOUT init 3min`);
       isInitializing = false;
-      reject(new Error(`Timeout init: ${initError || 'sin error'}`));
+      reject(new Error(`Timeout: ${initError || 'sin error'}`));
     }, 3 * 60 * 1000);
 
     readyResolvers.push(() => {
@@ -445,9 +406,9 @@ async function initializeWhatsApp(clearSession = false) {
     });
 
     client.initialize()
-      .then(() => log('WHATSAPP', 'client.initialize() resolvió'))
+      .then(() => log('WHATSAPP', 'initialize() OK'))
       .catch((e) => {
-        logError('WHATSAPP', 'client.initialize() falló', e);
+        logError('WHATSAPP', 'initialize() falló', e);
         clearTimeout(timeout);
         isInitializing = false;
         initError = e.message;
@@ -458,7 +419,7 @@ async function initializeWhatsApp(clearSession = false) {
 
 async function reconnect() {
   reconnectAttempts++;
-  log('WHATSAPP', `═══ RECONNECT (intento ${reconnectAttempts}) ═══`);
+  log('WHATSAPP', `═══ RECONNECT #${reconnectAttempts} ═══`);
   stats.reconnects++;
   try {
     return await initializeWhatsApp(false);
@@ -469,7 +430,7 @@ async function reconnect() {
 }
 
 async function restartForQR() {
-  log('WHATSAPP', '═══ RESTART PARA QR ═══');
+  log('WHATSAPP', '═══ RESTART QR ═══');
   stats.qrRegens++;
   try {
     if (client) { try { await client.destroy(); } catch (e) {} }
@@ -490,16 +451,12 @@ async function restartForQR() {
 async function getReadyClient() {
   if (client && isReady) return client;
   if (!client || !isInitializing) return initializeWhatsApp(false);
-  return new Promise((resolve) => {
-    readyResolvers.push(() => resolve(client));
-  });
+  return new Promise((resolve) => readyResolvers.push(() => resolve(client)));
 }
 
 // ══════════════════════════════════════════
-// ⭐ CHECK — v9
-// 1. Health check rápido
-// 2. Solo getNumberId con timeout corto
-// 3. Timeout → SOSPECHOSO (podría ser suspendido O página atascada)
+// ⭐ CHECK NUMBER STATUS v10
+// Cascada: health → getNumberId → health → isRegisteredUser
 // ══════════════════════════════════════════
 
 async function checkNumberStatus(phone) {
@@ -509,21 +466,17 @@ async function checkNumberStatus(phone) {
 
   log('CHECK', '════════════════════════════════════════');
   log('CHECK', `VERIFICANDO: ${phone}`);
-  log('CHECK', `ready=${isReady} | pageHealthy=${pageHealthy}`);
+  log('CHECK', `ready=${isReady} | healthy=${pageHealthy}`);
   log('CHECK', '════════════════════════════════════════');
 
   try {
-    // ────────────────────────────────────────
     // PASO 0: ¿Conectado?
-    // ────────────────────────────────────────
     if ((!isReady || !client) && !isInitializing) {
-      setImmediate(() => {
-        reconnect().catch(e => logError('CHECK', 'Error reconnect', e));
-      });
+      setImmediate(() => reconnect().catch(e => logError('CHECK', 'Reconnect', e)));
       return {
         status: 'NOT_CONNECTED',
-        message: '🔄 WhatsApp reconectando...\n\n⏳ Espera 1-2 minutos.',
-        raw: { ready: isReady, autoReconnect: true },
+        message: '🔄 WhatsApp reconectando...\n\nEspera 1-2 min.',
+        raw: { autoReconnect: true },
       };
     }
 
@@ -531,63 +484,122 @@ async function checkNumberStatus(phone) {
       const elapsed = initStartTime ? ((Date.now() - initStartTime) / 1000).toFixed(1) : '?';
       return {
         status: 'NOT_CONNECTED',
-        message: `⏳ WhatsApp inicializando (${elapsed}s)...\n\nEspera 1-2 minutos.`,
-        raw: { ready: isReady, initializing: isInitializing },
+        message: `⏳ Inicializando (${elapsed}s)...\n\nEspera 1-2 min.`,
+        raw: { initializing: true },
       };
     }
 
     const c = client;
 
-    // ────────────────────────────────────────
-    // PASO 1: Health check rápido (2s)
-    // ────────────────────────────────────────
-    log('CHECK', '[PASO 1/2] Health check...');
-    const healthy = await healthCheckPage();
+    // ══════════════════════════════════════════
+    // PASO 1: Health check (2s)
+    // ══════════════════════════════════════════
+    log('CHECK', '[PASO 1/4] Health check...');
+    const healthy1 = await healthCheckPage();
 
-    if (!healthy) {
-      log('CHECK', '⚠️ Página no responde. Reconnect programado.');
-
-      setImmediate(async () => {
-        try { await reconnect(); } catch (e) {}
-      });
-
+    if (!healthy1) {
+      log('CHECK', '⚠️ Página no responde → reconnect');
+      setImmediate(() => reconnect().catch(e => {}));
       return {
         status: 'ERROR',
-        message: '⚠️ WhatsApp está reconectando. Intenta en 1-2 minutos.',
-        raw: { reason: 'page_unhealthy', elapsedMs: Date.now() - start },
+        message: '⚠️ WhatsApp reconectando. Intenta en 1-2 min.',
+        raw: { reason: 'page_unhealthy' },
       };
     }
+    log('CHECK', '[PASO 1/4] ✅ Página OK');
 
-    log('CHECK', '[PASO 1/2] ✅ Página OK');
-
-    // ────────────────────────────────────────
-    // PASO 2: getNumberId (timeout 10s)
-    // ────────────────────────────────────────
-    log('CHECK', `[PASO 2/2] getNumberId(${phone})...`);
+    // ══════════════════════════════════════════
+    // PASO 2: getNumberId (10s)
+    // ══════════════════════════════════════════
+    log('CHECK', `[PASO 2/4] getNumberId(${phone})...`);
 
     let numberId = null;
-    let checkError = null;
+    let getNumberIdError = null;
 
     try {
       const t0 = Date.now();
-      numberId = await withTimeout(
-        c.getNumberId(phone),
-        10000,
-        'getNumberId'
-      );
-      const elapsed = Date.now() - t0;
-      log('CHECK', `✅ getNumberId → ${numberId ? numberId._serialized : 'null'} (${elapsed}ms)`);
+      numberId = await withTimeout(c.getNumberId(phone), 10000, 'getNumberId');
+      log('CHECK', `✅ getNumberId → ${numberId ? numberId._serialized : 'null'} (${Date.now() - t0}ms)`);
     } catch (e) {
-      checkError = e;
+      getNumberIdError = e;
       logError('CHECK', 'getNumberId falló', e);
 
       if (isPageBroken(e)) {
-        setImmediate(async () => {
-          try { await reconnect(); } catch (err) {}
-        });
+        setImmediate(() => reconnect().catch(e => {}));
         return {
           status: 'ERROR',
-          message: '⚠️ WhatsApp se desconectó. Reconectando...\n\nIntenta en 1-2 minutos.',
+          message: '⚠️ WhatsApp reconectando. Intenta en 1-2 min.',
+          raw: { reason: 'page_broken' },
+        };
+      }
+    }
+
+    // Si null explícito → NO EXISTE
+    if (numberId === null && !getNumberIdError) {
+      log('CHECK', `❌ getNumberId=null → PERMANENT_BAN`);
+      stats.failedChecks++;
+      return {
+        status: 'PERMANENT_BAN',
+        message: '❌ No está registrado en WhatsApp',
+        raw: { isRegistered: false, elapsedMs: Date.now() - start },
+      };
+    }
+
+    // ══════════════════════════════════════════
+    // PASO 3: Health check de nuevo (¿se atascó con getNumberId?)
+    // ══════════════════════════════════════════
+    log('CHECK', '[PASO 3/4] Health check post-getNumberId...');
+    const healthy2 = await healthCheckPage();
+
+    if (!healthy2) {
+      log('CHECK', '⚠️ Página se atascó tras getNumberId → reconnect');
+      setImmediate(() => reconnect().catch(e => {}));
+      return {
+        status: 'ERROR',
+        message: '⚠️ WhatsApp reconectando. Intenta en 1-2 min.',
+        raw: { reason: 'page_stuck' },
+      };
+    }
+    log('CHECK', '[PASO 3/4] ✅ Página sigue OK');
+
+    // Si getNumberId falló con timeout PERO la página está sana → SUSPENDIDO
+    if (getNumberIdError) {
+      log('CHECK', `❌ getNumberId timeout + página OK → SUSPENDIDO`);
+      stats.failedChecks++;
+      return {
+        status: 'PERMANENT_BAN',
+        message: '❌ Cuenta suspendida (WhatsApp no responde al número)',
+        raw: { reason: 'getNumberId_timeout_page_ok', elapsedMs: Date.now() - start },
+      };
+    }
+
+    // ══════════════════════════════════════════
+    // PASO 4: isRegisteredUser (detecta suspensión real)
+    // Usamos el ID específico que devolvió getNumberId
+    // ══════════════════════════════════════════
+    const targetId = numberId._serialized;
+    log('CHECK', `[PASO 4/4] isRegisteredUser(${targetId})...`);
+
+    let isRegistered = null;
+    let isRegError = null;
+
+    try {
+      const t0 = Date.now();
+      isRegistered = await withTimeout(
+        c.isRegisteredUser(targetId),
+        12000,
+        'isRegisteredUser'
+      );
+      log('CHECK', `✅ isRegisteredUser → ${isRegistered} (${Date.now() - t0}ms)`);
+    } catch (e) {
+      isRegError = e;
+      logError('CHECK', 'isRegisteredUser falló', e);
+
+      if (isPageBroken(e)) {
+        setImmediate(() => reconnect().catch(e => {}));
+        return {
+          status: 'ERROR',
+          message: '⚠️ WhatsApp reconectando. Intenta en 1-2 min.',
           raw: { reason: 'page_broken' },
         };
       }
@@ -596,93 +608,36 @@ async function checkNumberStatus(phone) {
     const elapsed = Date.now() - start;
     stats.avgCheckMs = stats.avgCheckMs === 0 ? elapsed : (stats.avgCheckMs + elapsed) / 2;
 
-    // ══════════════════════════════════════════
-    // INTERPRETACIÓN
-    // ══════════════════════════════════════════
-
-    // ── Caso 1: getNumberId devolvió null → no registrado
-    if (numberId === null && !checkError) {
-      log('CHECK', `❌ getNumberId=null → PERMANENT_BAN (${elapsed}ms)`);
+    // Interpretación
+    if (isRegError) {
+      // Timeout en isRegisteredUser con página sana → SOSPECHOSO
+      // WhatsApp se cuelga al verificar cuentas suspendidas
+      log('CHECK', `❌ isRegisteredUser timeout + página OK → SUSPENDIDO (${elapsed}ms)`);
       stats.failedChecks++;
       return {
         status: 'PERMANENT_BAN',
-        message: '❌ No está registrado en WhatsApp',
-        raw: { isRegistered: false, elapsedMs: elapsed },
+        message: '❌ Cuenta suspendida (verificación de cuenta no responde)',
+        raw: { reason: 'isRegisteredUser_timeout', elapsedMs: elapsed },
       };
     }
 
-    // ── Caso 2: getNumberId devolvió ID → ACTIVO
-    if (numberId && !checkError) {
-      log('CHECK', `✅ ACTIVO (${elapsed}ms)`);
-      stats.successChecks++;
-      return {
-        status: 'ACTIVE',
-        message: '✅ Número activo',
-        raw: { isRegistered: true, numberId: numberId._serialized, elapsedMs: elapsed },
-      };
-    }
-
-    // ── Caso 3: getNumberId timeout → SOSPECHOSO
-    // (el número podría estar suspendido O la página atascada)
-    if (checkError && checkError.isTimeout) {
-      log('CHECK', `⚠️ getNumberId timeout → verificar con health check...`);
-
-      // Segundo health check para distinguir suspensión de página atascada
-      const stillHealthy = await healthCheckPage();
-
-      if (!stillHealthy) {
-        log('CHECK', '❌ Página no responde tras timeout. Es problema de página.');
-        setImmediate(async () => {
-          try { await reconnect(); } catch (e) {}
-        });
-        return {
-          status: 'ERROR',
-          message: '⚠️ WhatsApp está reconectando. Intenta en 1-2 minutos.',
-          raw: { reason: 'page_unhealthy_after_timeout', elapsedMs: elapsed },
-        };
-      }
-
-      // Página OK pero getNumberId timeout → SUSPENDIDO
-      log('CHECK', `❌ Página OK pero getNumberId timeout → SUSPENDIDO (${elapsed}ms)`);
+    if (isRegistered === false) {
+      log('CHECK', `❌ isRegisteredUser=false → SUSPENDIDO (${elapsed}ms)`);
       stats.failedChecks++;
       return {
         status: 'PERMANENT_BAN',
-        message: '❌ Cuenta suspendida (WhatsApp no responde al número)',
-        raw: {
-          reason: 'getNumberId_timeout_but_page_ok',
-          elapsedMs: elapsed,
-        },
+        message: '❌ Cuenta suspendida o baneada',
+        raw: { isRegistered: false, numberId: targetId, elapsedMs: elapsed },
       };
     }
 
-    // ── Caso 4: Otro error
-    if (checkError) {
-      const classified = classifyWhatsAppError(checkError.message);
-      if (classified) {
-        stats.failedChecks++;
-        return {
-          status: classified,
-          message:
-            classified === 'TEMPORARY_BAN' ? '⚠️ Baneo temporal' :
-            classified === 'SPAM_BAN' ? '🚫 Ban por spam' :
-            '❌ Cuenta suspendida',
-          raw: { error: checkError.message, elapsedMs: elapsed },
-        };
-      }
-
-      stats.failedChecks++;
-      return {
-        status: 'ERROR',
-        message: `❌ Error: ${checkError.message}`,
-        raw: { error: checkError.message, elapsedMs: elapsed },
-      };
-    }
-
-    // Fallback
+    // ✅ ACTIVO (ambos pasos OK)
+    log('CHECK', `✅ ACTIVO (${elapsed}ms)`);
+    stats.successChecks++;
     return {
-      status: 'UNKNOWN',
-      message: '❓ Estado indeterminado',
-      raw: { elapsedMs: elapsed },
+      status: 'ACTIVE',
+      message: '✅ Número activo',
+      raw: { numberId: targetId, isRegistered: true, elapsedMs: elapsed },
     };
 
   } catch (e) {
