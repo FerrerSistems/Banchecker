@@ -1,6 +1,9 @@
 /**
  * SISTEMA DE MONITOREO
- * Escanea números cada 60 segundos y notifica cambios
+ * - Intervalo aleatorio entre 5 y 10 minutos (evita patrones detectables)
+ * - Rate limiting global
+ * - Jitter por número
+ * - Full debug
  */
 
 const config = require('./config');
@@ -9,17 +12,109 @@ const whatsapp = require('./whatsapp');
 const github = require('./github');
 
 // ══════════════════════════════════════════
-// ESTADO DEL MONITOR
+// CONFIGURACIÓN
 // ══════════════════════════════════════════
 
-let monitorInterval = null;
+const CONFIG = {
+  // Intervalo entre ciclos (aleatorio entre 5 y 10 minutos)
+  INTERVAL_MIN_MS: 5 * 60 * 1000,   // 5 min
+  INTERVAL_MAX_MS: 10 * 60 * 1000,  // 10 min
+
+  // Pausa entre cada número dentro de un ciclo (aleatorio 30-60s)
+  PER_NUMBER_MIN_MS: 30 * 1000,     // 30s
+  PER_NUMBER_MAX_MS: 60 * 1000,     // 60s
+
+  // Horario activo (hora local del servidor)
+  ACTIVE_HOURS_START: 7,             // 7 AM
+  ACTIVE_HOURS_END: 23,              // 11 PM
+
+  // Cooldown por número (si ya se consultó en los últimos X min, saltar)
+  PER_NUMBER_COOLDOWN_MS: 4 * 60 * 1000, // 4 min
+};
+
+// ══════════════════════════════════════════
+// ESTADO
+// ══════════════════════════════════════════
+
+let monitorTimeout = null;
 let isRunning = false;
 let botInstance = null;
+let currentCycleNumber = 0;
 
 const monitorCache = new Map();
+const lastCheckByNumber = new Map(); // phone → timestamp
+
+// Stats
+const stats = {
+  cyclesRun: 0,
+  totalChecks: 0,
+  bannedDetected: 0,
+  skipped: 0,
+  errors: 0,
+  startTime: Date.now(),
+};
 
 // ══════════════════════════════════════════
-// INICIAR MONITOR
+// UTILIDADES
+// ══════════════════════════════════════════
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+/**
+ * Delay aleatorio entre min y max
+ */
+function randomDelay(minMs, maxMs) {
+  return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+}
+
+/**
+ * Formatear ms a string legible
+ */
+function formatMs(ms) {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  return rs > 0 ? `${m}m ${rs}s` : `${m}m`;
+}
+
+/**
+ * ¿Estamos en horario activo?
+ */
+function isActiveHour() {
+  const hour = new Date().getHours();
+  const active = hour >= CONFIG.ACTIVE_HOURS_START && hour < CONFIG.ACTIVE_HOURS_END;
+  return active;
+}
+
+/**
+ * ¿Se puede verificar este número ahora? (cooldown)
+ */
+function canCheckNumber(phone) {
+  const last = lastCheckByNumber.get(phone);
+  if (!last) return true;
+  return (Date.now() - last) >= CONFIG.PER_NUMBER_COOLDOWN_MS;
+}
+
+/**
+ * Marcar número como verificado ahora
+ */
+function markNumberChecked(phone) {
+  lastCheckByNumber.set(phone, Date.now());
+
+  // Limpieza periódica
+  if (lastCheckByNumber.size > 5000) {
+    const cutoff = Date.now() - 60 * 60 * 1000; // 1h
+    for (const [k, v] of lastCheckByNumber.entries()) {
+      if (v < cutoff) lastCheckByNumber.delete(k);
+    }
+  }
+}
+
+// ══════════════════════════════════════════
+// START MONITOR
 // ══════════════════════════════════════════
 
 async function startMonitor(telegramBot) {
@@ -31,33 +126,60 @@ async function startMonitor(telegramBot) {
   botInstance = telegramBot;
   isRunning = true;
 
-  dbg('MONITOR', `Iniciando monitor (intervalo: ${config.monitor.intervalMs}ms)`);
+  console.log(`[MONITOR] ═══ INICIANDO ═══`);
+  console.log(`[MONITOR] Intervalo: ${formatMs(CONFIG.INTERVAL_MIN_MS)} - ${formatMs(CONFIG.INTERVAL_MAX_MS)} (aleatorio)`);
+  console.log(`[MONITOR] Pausa entre números: ${formatMs(CONFIG.PER_NUMBER_MIN_MS)} - ${formatMs(CONFIG.PER_NUMBER_MAX_MS)}`);
+  console.log(`[MONITOR] Horario activo: ${CONFIG.ACTIVE_HOURS_START}h - ${CONFIG.ACTIVE_HOURS_END}h`);
+  console.log(`[MONITOR] Cooldown por número: ${formatMs(CONFIG.PER_NUMBER_COOLDOWN_MS)}`);
 
   await refreshMonitorCache();
-  await runMonitorCycle();
 
-  monitorInterval = setInterval(async () => {
-    await runMonitorCycle();
-  }, config.monitor.intervalMs);
+  // Primer ciclo con delay de 1 minuto para dejar que WhatsApp se estabilice
+  console.log('[MONITOR] Esperando 1 min antes del primer ciclo...');
+  await sleep(60 * 1000);
 
-  dbg('MONITOR', '✅ Monitor iniciado');
+  scheduleNextCycle(0);
 }
 
 // ══════════════════════════════════════════
-// DETENER MONITOR
+// SCHEDULE — Programa el siguiente ciclo
+// ══════════════════════════════════════════
+
+function scheduleNextCycle(delayMs = null) {
+  if (!isRunning) return;
+
+  const delay = delayMs !== null
+    ? delayMs
+    : randomDelay(CONFIG.INTERVAL_MIN_MS, CONFIG.INTERVAL_MAX_MS);
+
+  console.log(`[MONITOR] ⏰ Próximo ciclo en ${formatMs(delay)}`);
+
+  monitorTimeout = setTimeout(async () => {
+    try {
+      await runMonitorCycle();
+    } catch (e) {
+      console.error(`[MONITOR] Error en ciclo: ${e.message}`);
+    } finally {
+      scheduleNextCycle(); // Reprogramar
+    }
+  }, delay);
+}
+
+// ══════════════════════════════════════════
+// STOP
 // ══════════════════════════════════════════
 
 function stopMonitor() {
-  if (monitorInterval) {
-    clearInterval(monitorInterval);
-    monitorInterval = null;
+  if (monitorTimeout) {
+    clearTimeout(monitorTimeout);
+    monitorTimeout = null;
   }
   isRunning = false;
   dbg('MONITOR', '⏹️ Monitor detenido');
 }
 
 // ══════════════════════════════════════════
-// REFRESCAR CACHÉ
+// REFRESH CACHE
 // ══════════════════════════════════════════
 
 async function refreshMonitorCache() {
@@ -72,20 +194,37 @@ async function refreshMonitorCache() {
       monitorCache.set(userId, new Set(numbers));
     }
 
-    dbg('MONITOR', `Caché actualizado: ${monitorCache.size} usuarios`);
+    console.log(`[MONITOR] Cache: ${monitorCache.size} usuarios`);
   } catch (e) {
-    dbg('MONITOR', `❌ Error refrescando caché: ${e.message}`);
+    console.error(`[MONITOR] Error cache: ${e.message}`);
   }
 }
 
 // ══════════════════════════════════════════
-// CICLO DE MONITOREO
+// CICLO PRINCIPAL
 // ══════════════════════════════════════════
 
 async function runMonitorCycle() {
-  dbg('MONITOR', '🔄 Ejecutando ciclo...');
+  currentCycleNumber++;
+  stats.cyclesRun++;
+
+  console.log(`\n[MONITOR] ═══════ CICLO #${currentCycleNumber} ═══════`);
+  console.log(`[MONITOR] Hora: ${new Date().toLocaleString('es-ES')}`);
+
+  // ¿Está en horario activo?
+  if (!isActiveHour()) {
+    console.log(`[MONITOR] 😴 Fuera de horario activo (${new Date().getHours()}h). Saltando ciclo.`);
+    return;
+  }
+
+  // ¿WhatsApp está listo?
+  if (!whatsapp.isReady()) {
+    console.log(`[MONITOR] ⚠️ WhatsApp no listo. Saltando ciclo.`);
+    return;
+  }
 
   try {
+    // Cargar datos frescos
     const suspendedData = await github.getSuspendedNumbers();
     const suspendedSet = new Set(suspendedData.numbers || []);
 
@@ -94,25 +233,64 @@ async function runMonitorCycle() {
 
     await refreshMonitorCache();
 
+    // Contar total de números a verificar
+    let totalNumbers = 0;
+    for (const userId of authorizedUsers) {
+      const numbers = monitorCache.get(userId);
+      if (numbers) totalNumbers += numbers.size;
+    }
+
+    console.log(`[MONITOR] ${authorizedUsers.length} usuarios, ${totalNumbers} números`);
+
+    if (totalNumbers === 0) {
+      console.log(`[MONITOR] No hay números. Fin del ciclo.`);
+      return;
+    }
+
+    // Verificar cada número
+    let checked = 0;
     for (const userId of authorizedUsers) {
       const numbers = monitorCache.get(userId);
       if (!numbers || numbers.size === 0) continue;
 
-      for (const phone of numbers) {
+      for (const phone of Array.from(numbers)) {
+        // Saltar si ya está suspendido
         if (suspendedSet.has(phone)) {
-          dbg('MONITOR', `⏭️ ${phone} ya suspendido, saltando`);
+          console.log(`[MONITOR] ⏭️ ${phone} ya suspendido`);
           continue;
         }
 
+        // Saltar si está en cooldown
+        if (!canCheckNumber(phone)) {
+          const last = lastCheckByNumber.get(phone);
+          const elapsed = Date.now() - last;
+          console.log(`[MONITOR] ⏭️ ${phone} en cooldown (${formatMs(elapsed)}/${formatMs(CONFIG.PER_NUMBER_COOLDOWN_MS)})`);
+          stats.skipped++;
+          continue;
+        }
+
+        // Verificar
+        checked++;
+        stats.totalChecks++;
+        markNumberChecked(phone);
+
+        console.log(`[MONITOR] 🔍 Verificando ${phone} (${checked}/${totalNumbers})...`);
+
         try {
           const result = await whatsapp.checkNumberStatus(phone);
-          dbg('MONITOR', `📊 ${phone} → ${result.status}`);
 
-          if (result.status !== 'ACTIVE' && result.status !== 'VERIFY') {
+          console.log(`[MONITOR] 📊 ${phone} → ${result.status}`);
+
+          // Si está baneado
+          if (result.status === 'PERMANENT_BAN' || result.status === 'SPAM_BAN' || result.status === 'TEMPORARY_BAN') {
+            console.log(`[MONITOR] 🚫 ${phone} BANEADO → Notificando a ${userId}`);
+
+            // Agregar a suspendidos
             suspendedData.numbers.push(phone);
             suspendedSet.add(phone);
             await github.setSuspendedNumbers(suspendedData);
 
+            // Eliminar de lista del usuario
             numbers.delete(phone);
             monitorCache.set(userId, numbers);
             await github.setUserMonitorList(userId, {
@@ -120,71 +298,88 @@ async function runMonitorCycle() {
               numbers: Array.from(numbers),
             });
 
+            // Notificar
             await notifyUser(userId, phone, result);
+            stats.bannedDetected++;
 
-            const freshSuspended = await github.getSuspendedNumbers();
+            // Recargar suspendidos (para otros usuarios)
+            const fresh = await github.getSuspendedNumbers();
             suspendedSet.clear();
-            (freshSuspended.numbers || []).forEach(n => suspendedSet.add(n));
-
-            dbg('MONITOR', `🚫 ${phone} baneado y notificado a ${userId}`);
+            (fresh.numbers || []).forEach(n => suspendedSet.add(n));
+          } else if (result.status === 'ACTIVE') {
+            console.log(`[MONITOR] ✅ ${phone} activo`);
+          } else if (result.status === 'ERROR') {
+            console.log(`[MONITOR] ⚠️ ${phone} error: ${result.message}`);
+            stats.errors++;
           }
+
         } catch (e) {
-          dbg('MONITOR', `❌ Error verificando ${phone}: ${e.message}`);
+          console.error(`[MONITOR] ❌ Error en ${phone}: ${e.message}`);
+          stats.errors++;
         }
 
-        await sleep(500);
+        // Pausa aleatoria entre números (30-60s)
+        const pause = randomDelay(CONFIG.PER_NUMBER_MIN_MS, CONFIG.PER_NUMBER_MAX_MS);
+        console.log(`[MONITOR] ⏸️ Pausa ${formatMs(pause)} antes del siguiente...`);
+        await sleep(pause);
       }
     }
 
-    dbg('MONITOR', '✅ Ciclo completado');
+    console.log(`[MONITOR] ✅ Ciclo #${currentCycleNumber} completado (${checked} verificados)`);
+    console.log(`[MONITOR] 📊 Stats: ${JSON.stringify(stats)}`);
+    console.log(`[MONITOR] ═══════════════════════════\n`);
+
   } catch (e) {
-    dbg('MONITOR', `❌ Error en ciclo: ${e.message}`);
+    console.error(`[MONITOR] ❌ Error en ciclo: ${e.message}`);
+    console.error(e.stack);
   }
 }
 
 // ══════════════════════════════════════════
-// NOTIFICAR AL USUARIO
+// NOTIFICAR
 // ══════════════════════════════════════════
 
 async function notifyUser(userId, phone, result) {
   if (!botInstance) {
-    dbg('MONITOR', '⚠️ No hay bot para notificar');
+    console.log('[MONITOR] ⚠️ No hay bot para notificar');
     return;
   }
 
+  const statusEmoji =
+    result.status === 'TEMPORARY_BAN' ? '⚠️' :
+    result.status === 'SPAM_BAN' ? '🚫' :
+    '❌';
+
+  const statusText =
+    result.status === 'TEMPORARY_BAN' ? 'Baneo temporal' :
+    result.status === 'SPAM_BAN' ? 'Baneo por spam' :
+    'Baneo permanente';
+
   const message = [
-    '🚨 *ALERTA DE BANEO* 🚨',
+    '🚨 <b>ALERTA DE BANEO</b> 🚨',
     '',
-    `📱 *Número:* \`+${phone}\``,
-    `📊 *Estado:* ${result.message}`,
-    `🔍 *Detalles:* ${result.raw?.error || result.raw?.name || 'Sin detalles'}`,
+    `📱 <b>Número:</b> <code>+${phone}</code>`,
+    `${statusEmoji} <b>Estado:</b> ${statusText}`,
+    `💬 <b>Mensaje:</b> ${result.message || 'N/A'}`,
     '',
-    `⏰ *Fecha:* ${new Date().toLocaleString('es-ES')}`,
+    `⏰ <b>Fecha:</b> ${new Date().toLocaleString('es-ES')}`,
     '',
-    '❌ Este número ha sido *eliminado* de tu lista de monitoreo.',
+    '❌ Este número ha sido <b>eliminado</b> de tu lista de monitoreo.',
     '💡 Ya no se volverá a monitorear.',
   ].join('\n');
 
   try {
     await botInstance.telegram.sendMessage(userId, message, {
-      parse_mode: 'Markdown',
+      parse_mode: 'HTML',
     });
-    dbg('MONITOR', `📨 Notificación enviada a ${userId}`);
+    console.log(`[MONITOR] 📨 Notificación enviada a ${userId}`);
   } catch (e) {
-    dbg('MONITOR', `❌ Error enviando a ${userId}: ${e.message}`);
+    console.error(`[MONITOR] ❌ Error enviando a ${userId}: ${e.message}`);
   }
 }
 
 // ══════════════════════════════════════════
-// UTILIDADES
-// ══════════════════════════════════════════
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-
-// ══════════════════════════════════════════
-// AGREGAR NÚMERO
+// ADD / REMOVE
 // ══════════════════════════════════════════
 
 async function addNumberToMonitor(userId, phone) {
@@ -202,16 +397,11 @@ async function addNumberToMonitor(userId, phone) {
 
   numbers.push(phone);
   await github.setUserMonitorList(userId, { userId, numbers });
-
   monitorCache.set(userId, new Set(numbers));
 
-  dbg('MONITOR', `➕ ${phone} agregado al monitor de ${userId}`);
+  console.log(`[MONITOR] ➕ ${phone} agregado a ${userId}`);
   return { success: true };
 }
-
-// ══════════════════════════════════════════
-// ELIMINAR NÚMERO
-// ══════════════════════════════════════════
 
 async function removeNumberFromMonitor(userId, phone) {
   const data = await github.getUserMonitorList(userId);
@@ -226,12 +416,12 @@ async function removeNumberFromMonitor(userId, phone) {
   await github.setUserMonitorList(userId, { userId, numbers });
   monitorCache.set(userId, new Set(numbers));
 
-  dbg('MONITOR', `➖ ${phone} eliminado del monitor de ${userId}`);
+  console.log(`[MONITOR] ➖ ${phone} eliminado de ${userId}`);
   return { success: true };
 }
 
 // ══════════════════════════════════════════
-// OBTENER LISTAS
+// GETTERS
 // ══════════════════════════════════════════
 
 async function getUserMonitoredNumbers(userId) {
@@ -242,6 +432,17 @@ async function getUserMonitoredNumbers(userId) {
 async function getUserSuspendedNumbers(userId) {
   const allSuspended = await github.getSuspendedNumbers();
   return allSuspended.numbers || [];
+}
+
+function getStats() {
+  return {
+    ...stats,
+    running: isRunning,
+    cyclesRun: stats.cyclesRun,
+    currentCycle: currentCycleNumber,
+    monitoredNumbers: monitorCache.size,
+    nextRun: monitorTimeout ? 'programado' : 'detenido',
+  };
 }
 
 // ══════════════════════════════════════════
@@ -257,5 +458,7 @@ module.exports = {
   removeNumberFromMonitor,
   getUserMonitoredNumbers,
   getUserSuspendedNumbers,
+  getStats,
   getMonitorCache: () => monitorCache,
+  CONFIG,
 };
