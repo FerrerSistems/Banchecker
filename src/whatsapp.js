@@ -458,7 +458,6 @@ async function getReadyClient() {
 // ⭐ CHECK NUMBER STATUS v10
 // Cascada: health → getNumberId → health → isRegisteredUser
 // ══════════════════════════════════════════
-
 async function checkNumberStatus(phone) {
   const release = await acquireLock();
   const start = Date.now();
@@ -492,9 +491,9 @@ async function checkNumberStatus(phone) {
     const c = client;
 
     // ══════════════════════════════════════════
-    // PASO 1: Health check (2s)
+    // PASO 1: Health check
     // ══════════════════════════════════════════
-    log('CHECK', '[PASO 1/4] Health check...');
+    log('CHECK', '[PASO 1/3] Health check...');
     const healthy1 = await healthCheckPage();
 
     if (!healthy1) {
@@ -506,12 +505,12 @@ async function checkNumberStatus(phone) {
         raw: { reason: 'page_unhealthy' },
       };
     }
-    log('CHECK', '[PASO 1/4] ✅ Página OK');
+    log('CHECK', '[PASO 1/3] ✅ Página OK');
 
     // ══════════════════════════════════════════
-    // PASO 2: getNumberId (10s)
+    // PASO 2: getNumberId (¿existe?)
     // ══════════════════════════════════════════
-    log('CHECK', `[PASO 2/4] getNumberId(${phone})...`);
+    log('CHECK', `[PASO 2/3] getNumberId(${phone})...`);
 
     let numberId = null;
     let getNumberIdError = null;
@@ -534,7 +533,7 @@ async function checkNumberStatus(phone) {
       }
     }
 
-    // Si null explícito → NO EXISTE
+    // ── Si getNumberId devolvió null → no existe
     if (numberId === null && !getNumberIdError) {
       log('CHECK', `❌ getNumberId=null → PERMANENT_BAN`);
       stats.failedChecks++;
@@ -545,55 +544,60 @@ async function checkNumberStatus(phone) {
       };
     }
 
-    // ══════════════════════════════════════════
-    // PASO 3: Health check de nuevo (¿se atascó con getNumberId?)
-    // ══════════════════════════════════════════
-    log('CHECK', '[PASO 3/4] Health check post-getNumberId...');
-    const healthy2 = await healthCheckPage();
-
-    if (!healthy2) {
-      log('CHECK', '⚠️ Página se atascó tras getNumberId → reconnect');
-      setImmediate(() => reconnect().catch(e => {}));
-      return {
-        status: 'ERROR',
-        message: '⚠️ WhatsApp reconectando. Intenta en 1-2 min.',
-        raw: { reason: 'page_stuck' },
-      };
-    }
-    log('CHECK', '[PASO 3/4] ✅ Página sigue OK');
-
-    // Si getNumberId falló con timeout PERO la página está sana → SUSPENDIDO
+    // ── Si getNumberId dio timeout/error
     if (getNumberIdError) {
-      log('CHECK', `❌ getNumberId timeout + página OK → SUSPENDIDO`);
+      log('CHECK', `⚠️ getNumberId falló → no concluyente`);
+
+      // Health check para distinguir
+      const healthy2 = await healthCheckPage();
+      if (!healthy2) {
+        setImmediate(() => reconnect().catch(e => {}));
+        return {
+          status: 'ERROR',
+          message: '⚠️ WhatsApp reconectando. Intenta en 1-2 min.',
+          raw: { reason: 'page_unhealthy_after_timeout' },
+        };
+      }
+
       stats.failedChecks++;
       return {
         status: 'PERMANENT_BAN',
-        message: '❌ Cuenta suspendida (WhatsApp no responde al número)',
-        raw: { reason: 'getNumberId_timeout_page_ok', elapsedMs: Date.now() - start },
+        message: '❌ Cuenta suspendida (getNumberId no responde)',
+        raw: { reason: 'getNumberId_timeout', elapsedMs: Date.now() - start },
       };
     }
 
     // ══════════════════════════════════════════
-    // PASO 4: isRegisteredUser (detecta suspensión real)
-    // Usamos el ID específico que devolvió getNumberId
+    // PASO 3: getContactById (metadatos)
+    // Aquí está la clave: isWAContact / isUser / name
     // ══════════════════════════════════════════
-    const targetId = numberId._serialized;
-    log('CHECK', `[PASO 4/4] isRegisteredUser(${targetId})...`);
+    const chatId = `${phone}@c.us`;
+    log('CHECK', `[PASO 3/3] getContactById(${chatId})...`);
 
-    let isRegistered = null;
-    let isRegError = null;
+    let contact = null;
+    let contactError = null;
 
     try {
       const t0 = Date.now();
-      isRegistered = await withTimeout(
-        c.isRegisteredUser(targetId),
+      contact = await withTimeout(
+        c.getContactById(chatId),
         12000,
-        'isRegisteredUser'
+        'getContactById'
       );
-      log('CHECK', `✅ isRegisteredUser → ${isRegistered} (${Date.now() - t0}ms)`);
+      const elapsed = Date.now() - t0;
+
+      log('CHECK', `✅ getContactById OK (${elapsed}ms)`);
+      log('CHECK', `   isWAContact: ${contact.isWAContact}`);
+      log('CHECK', `   isUser:      ${contact.isUser}`);
+      log('CHECK', `   isBusiness:  ${contact.isBusiness}`);
+      log('CHECK', `   isBlocked:   ${contact.isBlocked}`);
+      log('CHECK', `   name:        ${contact.name || '(vacío)'}`);
+      log('CHECK', `   pushname:    ${contact.pushname || '(vacío)'}`);
+      log('CHECK', `   shortName:   ${contact.shortName || '(vacío)'}`);
+      log('CHECK', `   number:      ${contact.number}`);
     } catch (e) {
-      isRegError = e;
-      logError('CHECK', 'isRegisteredUser falló', e);
+      contactError = e;
+      logError('CHECK', 'getContactById falló', e);
 
       if (isPageBroken(e)) {
         setImmediate(() => reconnect().catch(e => {}));
@@ -608,36 +612,117 @@ async function checkNumberStatus(phone) {
     const elapsed = Date.now() - start;
     stats.avgCheckMs = stats.avgCheckMs === 0 ? elapsed : (stats.avgCheckMs + elapsed) / 2;
 
-    // Interpretación
-    if (isRegError) {
-      // Timeout en isRegisteredUser con página sana → SOSPECHOSO
-      // WhatsApp se cuelga al verificar cuentas suspendidas
-      log('CHECK', `❌ isRegisteredUser timeout + página OK → SUSPENDIDO (${elapsed}ms)`);
-      stats.failedChecks++;
+    // ══════════════════════════════════════════
+    // INTERPRETACIÓN FINAL
+    // ══════════════════════════════════════════
+
+    // ── CASO 1: Contacto obtenido, analizar propiedades
+    if (contact) {
+      // ⭐ SEÑAL CLARA DE SUSPENSIÓN: isWAContact = false
+      if (contact.isWAContact === false) {
+        log('CHECK', `❌ isWAContact=false → SUSPENDIDO (${elapsed}ms)`);
+        stats.failedChecks++;
+        return {
+          status: 'PERMANENT_BAN',
+          message: '❌ Cuenta suspendida o baneada',
+          raw: {
+            isWAContact: false,
+            isUser: contact.isUser,
+            hasName: !!(contact.name || contact.pushname),
+            elapsedMs: elapsed,
+          },
+        };
+      }
+
+      // ⭐ SEÑAL: isUser = false Y sin nombre → SOSPECHOSO
+      if (contact.isUser === false && !contact.name && !contact.pushname) {
+        log('CHECK', `❌ isUser=false sin nombre → SUSPENDIDO (${elapsed}ms)`);
+        stats.failedChecks++;
+        return {
+          status: 'PERMANENT_BAN',
+          message: '❌ Cuenta suspendida (perfil inactivo)',
+          raw: {
+            isWAContact: contact.isWAContact,
+            isUser: false,
+            hasName: false,
+            elapsedMs: elapsed,
+          },
+        };
+      }
+
+      // ✅ TIENE NOMBRE → ACTIVO
+      if (contact.name || contact.pushname || contact.shortName) {
+        const name = contact.name || contact.pushname || contact.shortName;
+        log('CHECK', `✅ ACTIVO — "${name}" (${elapsed}ms)`);
+        stats.successChecks++;
+        return {
+          status: 'ACTIVE',
+          message: `✅ Número activo`,
+          raw: {
+            name,
+            isWAContact: contact.isWAContact,
+            isUser: contact.isUser,
+            isBusiness: contact.isBusiness,
+            elapsedMs: elapsed,
+          },
+        };
+      }
+
+      // ⭐ isWAContact=true pero sin nombre → ACTIVO (raro pero posible)
+      log('CHECK', `✅ isWAContact=true sin nombre → ACTIVO (${elapsed}ms)`);
+      stats.successChecks++;
       return {
-        status: 'PERMANENT_BAN',
-        message: '❌ Cuenta suspendida (verificación de cuenta no responde)',
-        raw: { reason: 'isRegisteredUser_timeout', elapsedMs: elapsed },
+        status: 'ACTIVE',
+        message: '✅ Número activo (sin nombre público)',
+        raw: {
+          isWAContact: contact.isWAContact,
+          isUser: contact.isUser,
+          hasName: false,
+          elapsedMs: elapsed,
+        },
       };
     }
 
-    if (isRegistered === false) {
-      log('CHECK', `❌ isRegisteredUser=false → SUSPENDIDO (${elapsed}ms)`);
+    // ── CASO 2: getContactById falló pero getNumberId OK
+    if (contactError) {
+      log('CHECK', `⚠️ getContactById falló pero número existe`);
+
+      // Clasificar el error si es específico
+      const classified = classifyWhatsAppError(contactError.message);
+      if (classified) {
+        stats.failedChecks++;
+        return {
+          status: classified,
+          message:
+            classified === 'TEMPORARY_BAN' ? '⚠️ Baneo temporal' :
+            classified === 'SPAM_BAN' ? '🚫 Ban por spam' :
+            '❌ Cuenta suspendida',
+          raw: { error: contactError.message, elapsedMs: elapsed },
+        };
+      }
+
+      // Error desconocido → NO CONCLUYENTE
+      // El número EXISTE (getNumberId OK) pero no se puede verificar el estado
+      log('CHECK', `⚠️ Error desconocido en getContactById → estado desconocido (${elapsed}ms)`);
       stats.failedChecks++;
       return {
-        status: 'PERMANENT_BAN',
-        message: '❌ Cuenta suspendida o baneada',
-        raw: { isRegistered: false, numberId: targetId, elapsedMs: elapsed },
+        status: 'UNKNOWN',
+        message:
+          '❓ Número existe pero no se pudo verificar el estado.\n\n' +
+          '💡 Intenta de nuevo en unos segundos.',
+        raw: {
+          numberId: numberId._serialized,
+          contactError: contactError.message,
+          elapsedMs: elapsed,
+        },
       };
     }
 
-    // ✅ ACTIVO (ambos pasos OK)
-    log('CHECK', `✅ ACTIVO (${elapsed}ms)`);
-    stats.successChecks++;
+    // Fallback
     return {
-      status: 'ACTIVE',
-      message: '✅ Número activo',
-      raw: { numberId: targetId, isRegistered: true, elapsedMs: elapsed },
+      status: 'UNKNOWN',
+      message: '❓ Estado indeterminado',
+      raw: { elapsedMs: elapsed },
     };
 
   } catch (e) {
