@@ -469,7 +469,9 @@ async function checkNumberStatus(phone) {
   log('CHECK', '════════════════════════════════════════');
 
   try {
+    // ══════════════════════════════════════════
     // PASO 0: ¿Conectado?
+    // ══════════════════════════════════════════
     if ((!isReady || !client) && !isInitializing) {
       setImmediate(() => reconnect().catch(e => logError('CHECK', 'Reconnect', e)));
       return {
@@ -493,7 +495,7 @@ async function checkNumberStatus(phone) {
     // ══════════════════════════════════════════
     // PASO 1: Health check
     // ══════════════════════════════════════════
-    log('CHECK', '[PASO 1/3] Health check...');
+    log('CHECK', '[PASO 1/4] Health check...');
     const healthy1 = await healthCheckPage();
 
     if (!healthy1) {
@@ -505,12 +507,12 @@ async function checkNumberStatus(phone) {
         raw: { reason: 'page_unhealthy' },
       };
     }
-    log('CHECK', '[PASO 1/3] ✅ Página OK');
+    log('CHECK', '[PASO 1/4] ✅ Página OK');
 
     // ══════════════════════════════════════════
-    // PASO 2: getNumberId (¿existe?)
+    // PASO 2: ¿Existe el número? (getNumberId)
     // ══════════════════════════════════════════
-    log('CHECK', `[PASO 2/3] getNumberId(${phone})...`);
+    log('CHECK', `[PASO 2/4] getNumberId(${phone})...`);
 
     let numberId = null;
     let getNumberIdError = null;
@@ -533,9 +535,9 @@ async function checkNumberStatus(phone) {
       }
     }
 
-    // ── Si getNumberId devolvió null → no existe
+    // Si getNumberId devolvió null → no existe
     if (numberId === null && !getNumberIdError) {
-      log('CHECK', `❌ getNumberId=null → PERMANENT_BAN`);
+      log('CHECK', `❌ getNumberId=null → NO REGISTRADO`);
       stats.failedChecks++;
       return {
         status: 'PERMANENT_BAN',
@@ -544,11 +546,10 @@ async function checkNumberStatus(phone) {
       };
     }
 
-    // ── Si getNumberId dio timeout/error
+    // Si getNumberId dio timeout/error → no concluyente
     if (getNumberIdError) {
       log('CHECK', `⚠️ getNumberId falló → no concluyente`);
 
-      // Health check para distinguir
       const healthy2 = await healthCheckPage();
       if (!healthy2) {
         setImmediate(() => reconnect().catch(e => {}));
@@ -568,36 +569,26 @@ async function checkNumberStatus(phone) {
     }
 
     // ══════════════════════════════════════════
-    // PASO 3: getContactById (metadatos)
-    // Aquí está la clave: isWAContact / isUser / name
+    // PASO 3: Device Count Signature (LA CLAVE)
+    // Consulta USync: cuántos dispositivos tiene vinculados
     // ══════════════════════════════════════════
-    const chatId = `${phone}@c.us`;
-    log('CHECK', `[PASO 3/3] getContactById(${chatId})...`);
+    const targetId = numberId._serialized;
+    log('CHECK', `[PASO 3/4] getContactDeviceCount(${targetId})...`);
 
-    let contact = null;
-    let contactError = null;
+    let deviceCount = null;
+    let deviceCountError = null;
 
     try {
       const t0 = Date.now();
-      contact = await withTimeout(
-        c.getContactById(chatId),
-        12000,
-        'getContactById'
+      deviceCount = await withTimeout(
+        c.getContactDeviceCount(targetId),
+        15000,
+        'getContactDeviceCount'
       );
-      const elapsed = Date.now() - t0;
-
-      log('CHECK', `✅ getContactById OK (${elapsed}ms)`);
-      log('CHECK', `   isWAContact: ${contact.isWAContact}`);
-      log('CHECK', `   isUser:      ${contact.isUser}`);
-      log('CHECK', `   isBusiness:  ${contact.isBusiness}`);
-      log('CHECK', `   isBlocked:   ${contact.isBlocked}`);
-      log('CHECK', `   name:        ${contact.name || '(vacío)'}`);
-      log('CHECK', `   pushname:    ${contact.pushname || '(vacío)'}`);
-      log('CHECK', `   shortName:   ${contact.shortName || '(vacío)'}`);
-      log('CHECK', `   number:      ${contact.number}`);
+      log('CHECK', `✅ getContactDeviceCount → ${deviceCount} dispositivos (${Date.now() - t0}ms)`);
     } catch (e) {
-      contactError = e;
-      logError('CHECK', 'getContactById falló', e);
+      deviceCountError = e;
+      logError('CHECK', 'getContactDeviceCount falló', e);
 
       if (isPageBroken(e)) {
         setImmediate(() => reconnect().catch(e => {}));
@@ -610,119 +601,58 @@ async function checkNumberStatus(phone) {
     }
 
     const elapsed = Date.now() - start;
-    stats.avgCheckMs = stats.avgCheckMs === 0 ? elapsed : (stats.avgCheckMs + elapsed) / 2;
 
     // ══════════════════════════════════════════
-    // INTERPRETACIÓN FINAL
+    // PASO 4: Interpretar Device Count
     // ══════════════════════════════════════════
 
-    // ── CASO 1: Contacto obtenido, analizar propiedades
-    if (contact) {
-      // ⭐ SEÑAL CLARA DE SUSPENSIÓN: isWAContact = false
-      if (contact.isWAContact === false) {
-        log('CHECK', `❌ isWAContact=false → SUSPENDIDO (${elapsed}ms)`);
-        stats.failedChecks++;
-        return {
-          status: 'PERMANENT_BAN',
-          message: '❌ Cuenta suspendida o baneada',
-          raw: {
-            isWAContact: false,
-            isUser: contact.isUser,
-            hasName: !!(contact.name || contact.pushname),
-            elapsedMs: elapsed,
-          },
-        };
-      }
+    // Si el método falló (versión antigua de whatsapp-web.js)
+    if (deviceCountError) {
+      log('CHECK', `⚠️ getContactDeviceCount no disponible: ${deviceCountError.message}`);
 
-      // ⭐ SEÑAL: isUser = false Y sin nombre → SOSPECHOSO
-      if (contact.isUser === false && !contact.name && !contact.pushname) {
-        log('CHECK', `❌ isUser=false sin nombre → SUSPENDIDO (${elapsed}ms)`);
-        stats.failedChecks++;
-        return {
-          status: 'PERMANENT_BAN',
-          message: '❌ Cuenta suspendida (perfil inactivo)',
-          raw: {
-            isWAContact: contact.isWAContact,
-            isUser: false,
-            hasName: false,
-            elapsedMs: elapsed,
-          },
-        };
-      }
-
-      // ✅ TIENE NOMBRE → ACTIVO
-      if (contact.name || contact.pushname || contact.shortName) {
-        const name = contact.name || contact.pushname || contact.shortName;
-        log('CHECK', `✅ ACTIVO — "${name}" (${elapsed}ms)`);
-        stats.successChecks++;
-        return {
-          status: 'ACTIVE',
-          message: `✅ Número activo`,
-          raw: {
-            name,
-            isWAContact: contact.isWAContact,
-            isUser: contact.isUser,
-            isBusiness: contact.isBusiness,
-            elapsedMs: elapsed,
-          },
-        };
-      }
-
-      // ⭐ isWAContact=true pero sin nombre → ACTIVO (raro pero posible)
-      log('CHECK', `✅ isWAContact=true sin nombre → ACTIVO (${elapsed}ms)`);
+      // Fallback: asumir ACTIVO (no podemos verificar)
+      log('CHECK', `⚠️ Fallback → asumiendo ACTIVO por getNumberId OK`);
       stats.successChecks++;
       return {
         status: 'ACTIVE',
-        message: '✅ Número activo (sin nombre público)',
+        message: '✅ Número activo (verificación parcial)',
         raw: {
-          isWAContact: contact.isWAContact,
-          isUser: contact.isUser,
-          hasName: false,
+          numberId: targetId,
+          deviceCountError: deviceCountError.message,
           elapsedMs: elapsed,
         },
       };
     }
 
-    // ── CASO 2: getContactById falló pero getNumberId OK
-    if (contactError) {
-      log('CHECK', `⚠️ getContactById falló pero número existe`);
-
-      // Clasificar el error si es específico
-      const classified = classifyWhatsAppError(contactError.message);
-      if (classified) {
-        stats.failedChecks++;
-        return {
-          status: classified,
-          message:
-            classified === 'TEMPORARY_BAN' ? '⚠️ Baneo temporal' :
-            classified === 'SPAM_BAN' ? '🚫 Ban por spam' :
-            '❌ Cuenta suspendida',
-          raw: { error: contactError.message, elapsedMs: elapsed },
-        };
-      }
-
-      // Error desconocido → NO CONCLUYENTE
-      // El número EXISTE (getNumberId OK) pero no se puede verificar el estado
-      log('CHECK', `⚠️ Error desconocido en getContactById → estado desconocido (${elapsed}ms)`);
+    // ── 0 dispositivos → BANEADO
+    if (deviceCount === 0) {
+      log('CHECK', `❌ 0 dispositivos → BANEADO (${elapsed}ms)`);
       stats.failedChecks++;
       return {
-        status: 'UNKNOWN',
-        message:
-          '❓ Número existe pero no se pudo verificar el estado.\n\n' +
-          '💡 Intenta de nuevo en unos segundos.',
-        raw: {
-          numberId: numberId._serialized,
-          contactError: contactError.message,
-          elapsedMs: elapsed,
-        },
+        status: 'PERMANENT_BAN',
+        message: '❌ Cuenta suspendida o baneada (sin dispositivos vinculados)',
+        raw: { deviceCount: 0, numberId: targetId, elapsedMs: elapsed },
       };
     }
 
-    // Fallback
+    // ── 1 dispositivo → SOSPECHOSO
+    if (deviceCount === 1) {
+      log('CHECK', `⚠️ 1 dispositivo → SOSPECHOSO (${elapsed}ms)`);
+      stats.failedChecks++;
+      return {
+        status: 'PERMANENT_BAN',
+        message: '❌ Cuenta suspendida (dispositivo genérico sin teléfono)',
+        raw: { deviceCount: 1, numberId: targetId, elapsedMs: elapsed },
+      };
+    }
+
+    // ── 2+ dispositivos → ACTIVO
+    log('CHECK', `✅ ${deviceCount} dispositivos → ACTIVO (${elapsed}ms)`);
+    stats.successChecks++;
     return {
-      status: 'UNKNOWN',
-      message: '❓ Estado indeterminado',
-      raw: { elapsedMs: elapsed },
+      status: 'ACTIVE',
+      message: `✅ Número activo (${deviceCount} dispositivos)`,
+      raw: { deviceCount, numberId: targetId, elapsedMs: elapsed },
     };
 
   } catch (e) {
