@@ -1,10 +1,11 @@
 FROM node:22-bookworm-slim
 
+# Variables básicas de entorno (NO pongas tokens aquí)
 ENV NODE_ENV=production \
     TZ=America/Lima \
     DEBIAN_FRONTEND=noninteractive
 
-# 1. Instalamos git (vital para Baileys) y tini (para cerrar procesos correctamente)
+# Instalamos git (necesario para Baileys), tini (para manejar procesos) y certificados
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     tini \
@@ -14,26 +15,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# 2. Copiamos los archivos de dependencias
+# Copiamos solo los archivos de dependencias primero (para aprovechar la caché de Docker)
 COPY package*.json ./
 
-# 3. Instalación limpia (borramos lockfile viejo para evitar conflictos)
-RUN rm -rf node_modules package-lock.json \
-    && npm install --omit=dev --no-audit --no-fund \
+# Instalamos las dependencias
+RUN npm install --omit=dev --no-audit --no-fund \
     && npm cache clean --force
 
-# 4. Copiamos el resto del código fuente
+# Copiamos el resto del código
 COPY . .
 
-# 5. Creamos las carpetas y le damos permisos al usuario "node" de TODO /app
-RUN mkdir -p /app/wa_session \
+# Creamos las carpetas necesarias y le damos permisos al usuario "node"
+RUN mkdir -p /app/wa_session /app/tokens \
     && chown -R node:node /app
 
-# 6. Cambiamos al usuario no-root
+# Usamos el usuario "node" (no root) por seguridad
 USER node
 
-# 7. Usamos tini como entrypoint para manejar señales de Docker
+# Tini maneja las señales de terminación correctamente
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
-# 8. Comando de inicio
+# Comando para iniciar el bot
 CMD ["node", "src/index.js"]
