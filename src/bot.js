@@ -11,7 +11,7 @@ const config = require('./config');
 const { dbg } = config;
 const github = require('./github');
 const monitor = require('./monitor');
-const whatsapp = require('./whatsapp');
+const whatsapp = require('./banchecker');
 
 // ══════════════════════════════════════════
 // HELPERS
