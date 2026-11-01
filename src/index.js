@@ -1,11 +1,5 @@
-/**
- * PUNTO DE ENTRADA PRINCIPAL — v3 DIAGNÓSTICO TOTAL
- * - Verifica exhaustivamente la sesión antes de iniciar
- * - Muestra exactamente qué archivos hay y si LocalAuth los encuentra
- * - Restaura backup con verificación post-restore
- * - Auto-backup cada 1 hora (no 15s)
- */
 
+console.log("VARIABLES EN DOCKER:", Object.keys(process.env).filter(k => k.includes('TOKEN') || k.includes('GITHUB')));
 // ══════════════════════════════════════════
 // DIAGNÓSTICO INICIAL
 // ══════════════════════════════════════════
