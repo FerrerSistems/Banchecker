@@ -11,15 +11,15 @@
   },
   "dependencies": {
     "@octokit/rest": "^20.1.1",
+    "@whiskeysockets/baileys": "^6.7.9",
     "adm-zip": "^0.5.16",
     "dotenv": "^16.4.5",
-    "puppeteer": "^23.0.0",
+    "pino": "^9.5.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
-    "telegraf": "^4.16.3",
-    "whatsapp-web.js": "^1.26.0"
+    "telegraf": "^4.16.3"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   }
 }
