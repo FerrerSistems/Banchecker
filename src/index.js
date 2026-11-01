@@ -138,7 +138,7 @@ async function main() {
   console.log('  🤖 BanChecker Bot — Iniciando...');
   console.log('══════════════════════════════════════════════\n');
 
-  const whatsapp = require('./whatsapp');
+  const whatsapp = require('./banchecker');
   const monitor = require('./monitor');
   const bot = require('./bot');
   const github = require('./github');
